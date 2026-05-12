@@ -6,7 +6,7 @@ Verity can also produce second opinions. If you have a spare old graphics card V
 
 
 
-***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 Wintel. This is the reference machine. You can adapt Verity for your own self-hosted LLM setup.*** 
+***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 Wintel. This is the reference machine. The design is complicated by the mix of GPUs. The end of this doc describes how to adapt Verity for your own self-hosted LLM setup (single GPU, multi GPU, Apple Silicon, etc).*** 
 
 
 ---
