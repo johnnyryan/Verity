@@ -31,46 +31,42 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
 
 ## Layers of protection against wrongness
 
-**No single check is reliable. The point is that their failure modes don't overlap.** Two LLMs trained on similar data tend to be wrong about the same things — when they agree, they often agree wrong. The NLI classifier was trained on entailment-labelled data instead of helpfulness preferences, so its mistakes look completely different from a chat model's. The recompute pass doesn't have a bias profile at all, because it isn't statistical. When two layers built on different machinery flag the same thing, that is much stronger evidence than any single LLM saying "are you sure?".
+Verity combines multiple checks: strict sourcing rules, a stronger critic LLM, a smaller critic LLM built with a different scratch corpus (because LLMs trained on similar data tend to be wrong about the same things), an encoder transformer trained on entailment labels, a regex evaluator, a stochastic re-sampler, and a logprob analyser. 
 
 ```
 
-                              WORKER ANSWER
-         (the LLM you chat with — Qwen 3.5 9B on the strong GPU)
-                       
+Initial answer in LM Studio passes through multiple layers              
   
    ┌────────────────────────────────────────────────────────────────────┐
-   │ LAYER 1 · Critic A — IBM Granite 8B (LLM)                          │
-   |   How       : different training family from the worker            │
-   │   Catches   : subtle code bugs, logic flaws, citation errors       │
-   │   Blind to  : mistakes the worker's training data also contains    │
+   │ LAYER 1 · Strict sourcing directive to primary LLM                 │
+   |   How       : baked in prompt and system prompt as backup          │
+   │   Catches   : fake facts and URLs                                  │
    ├────────────────────────────────────────────────────────────────────┤
    │ LAYER 2 · Critic B — IBM Granite 2B (LLM, distinct corpus)         │
    │   How       : same vendor as A, smaller, faster, different scratch │
    │   Catches   : simple errors, quick confirmations, second voice     │
-   │   Blind to  : subtle bugs the 8B sees                              │
    ├────────────────────────────────────────────────────────────────────┤
-   │ LAYER 3 · NLI claim-checker — DeBERTa-v3-large (NOT an LLM)        │
+   │ LAYER 3 · Critic B — IBM Granite 2B (LLM, distinct corpus)         │
+   │   How       : same vendor as A, smaller, faster, different scratch │
+   │   Catches   : simple errors, quick confirmations, second voice     │
+   ├────────────────────────────────────────────────────────────────────┤
+   │ LAYER 4 · NLI claim-checker — DeBERTa-v3-large (NOT an LLM)        │
    │   How       : encoder transformer, trained on entailment labels    │
    │   Catches   : factual contradictions of supplied prior_context     │
-   │   Blind to  : anything without a premise; multi-step reasoning     │
    ├────────────────────────────────────────────────────────────────────┤
-   │ LAYER 4 · Recompute pass — regex + arithmetic (NOT an LLM)         │
+   │ LAYER 5 · Recompute pass — regex + arithmetic (NOT an LLM)         │
    │   How       : pure code; deterministic; no model uncertainty       │
    │   Catches   : arithmetic errors, unit conversions — 100% precision │
-   │   Blind to  : anything that isn't a closed-form numeric expression │
    ├────────────────────────────────────────────────────────────────────┤
    │   /verifydeep and /verifydeeper add two more layers:               │
    ├────────────────────────────────────────────────────────────────────┤
-   │ LAYER 5 · Consistency — re-sample the worker N times               │
+   │ LAYER 6 · Consistency — re-sample the worker N times               │
    │   How       : ask the same question 2 (deep) or 5 (deeper) times   │
    │   Catches   : low-confidence guessing — answers that flicker       │
-   │   Blind to  : consistent overconfidence (always wrong the same way)│
    ├────────────────────────────────────────────────────────────────────┤
-   │ LAYER 6 · Perplexity — worker's own logprob entropy                │
+   │ LAYER 7 · Perplexity — worker's own logprob entropy                │
    │   How       : score the answer's tokens, flag low-confidence spans │
    │   Catches   : tokens the worker was hesitant about                 │
-   │   Blind to  : confident hallucinations                             │
    └────────────────────────────────────────────────────────────────────┘
                                     
                                     
@@ -79,9 +75,7 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
 
 
 ```
-The layers are deliberately built on different machinery — a 14 B-class LLM, an 8 B-class LLM from the same family but different scratch corpus, a 0.4 B encoder transformer trained on a different objective, a regex evaluator, a stochastic re-sampler, and a logprob analyser. Six different *kinds* of "wrong" are caught by six different *kinds* of check.
-
-A separate **disputes table** is computed *after* the consensus is decided. It surfaces concerns one critic raised but not the other, so users see disagreement even when the headline verdict is "pass".
+A disputes table is computed after the consensus is decided. It shows which critic raised concerns to the user sees disagreement even when the aggregated verdict is "pass". Depending on your System Prompt, the primary LLM may immediatelly redraft its answer based on Verity corrections, or you may be asked if you want it to. 
 
 ---
 
