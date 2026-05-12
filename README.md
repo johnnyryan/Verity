@@ -2,7 +2,11 @@
 
 LLMs confidently claim things that are manifestly untrue. Enforce has developed Verity, a tool that helps minimise false claims and fake sources from self-hosted LLMs. It can run on cheap, old hardware. We think it is the first MCP1 that combines cross-family LLM critics, NLI2, deterministic arithmetic recompute,3 consistency sampling,4 perplexity,5 and identifies disputes among these many critics. Today, we are releasing Verity for anyone to use, test, adapt, and improve. 
 
-Verity can also produce second opinions. If you have a spare old graphics card Verity can use it to produce second opinions at the same time that your primary LLMs responds. Both answers are then considered by your primary LLM. Once adapted for your hardware, you can easily use Verity in LM Studio. We are also sharing our system prompts, which help minimise LLM mistakes even without Verity.
+Verity can also produce second opinions. If you have a spare old graphics card Verity can use it to produce second opinions at the same time that your primary LLMs responds. Both answers are then considered by your primary LLM. Once adapted for your hardware, you can easily use Verity in LM Studio. We are also sharing our system prompts, which help minimise LLM mistakes even without Verity. 
+
+
+***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 PC. This is the reference machine. You can adapt Verity for your own self-hosted LLM setup.*** 
+
 
 ## Basic commands: 
 
@@ -24,8 +28,6 @@ Two additional commands: /verifydeep and /verifydeeper, add two more layers of p
 When you type `/verify`, four things happen at once across two GPUs and the CPU. The **worker** (the LLM you chat with on your strong GPU) is instructed to strictly source all facts. It will now claim only what it can validate with a working URL source. No more made up sources, and far fewer made up facts. Then it hands its last answer to a small Node.js process — the MCP server. That server fans the answer out to **two critics** (smaller LLMs on the older GPU that re-read the answer with fresh eyes), an **NLI claim-checker** (a small specialised classifier on the CPU that flags factual contradictions), and a **deterministic recompute pass** (a non-LLM CPU check that catches arithmetic mistakes). Their findings get aggregated into a single pass / warn / fail verdict and pasted back into the chat.
 
 Two of those checks are not LLMs — recompute is plain code, NLI is a 0.4 B-parameter encoder transformer that outputs three numbers per claim. That's the point: their failure modes don't overlap with the LLM critics, so when they agree there's strong evidence.
-
-The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 PC. You can adapt Verity for your own self-hosted LLM setup. 
 
 ---
 
@@ -97,6 +99,8 @@ The verity loads four models at the same time. None of them swap during normal o
 | Critic B   | IBM Granite 3.2 2B                   | IBM      | 2 B    | Q4_K_M | ~1.8 GB | 5700 XT / Ollama    |
 | NLI check  | DeBERTa-v3-large (cross-encoder)     | Microsoft| 0.4 B  | ONNX   | ~1 GB   | CPU                 |
 
+
+The reference 
 The 5070 Ti only hosts the worker (~5.5 GB of ~16 GB used). The 5700 XT hosts both critics (~5.8 GB of 8 GB, leaving ~2 GB for KV cache).
 
 ### Why each pick
