@@ -1,0 +1,31 @@
+{
+  "name": "@modelcontextprotocol/server-verity",
+  "version": "0.1.0",
+  "description": "Verity — multi-agent verification MCP server for LM Studio",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-server-verity": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p project/tsconfig.json && node -e \"try{require('fs').chmodSync('dist/index.js',0o755)}catch(e){}\"",
+    "start": "node dist/index.js --transport=http --port=8090",
+    "cli": "node dist/cli.js",
+    "watch": "tsc -p project/tsconfig.json --watch",
+    "test": "tsc -p project/tsconfig.json && node --test dist/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@huggingface/transformers": "^3.0.0",
+    "openai": "^4.60.0",
+    "express": "^4.19.0",
+    "js-tiktoken": "^1.0.14",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
