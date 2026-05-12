@@ -6,7 +6,7 @@ Verity can also produce second opinions. If you have a spare old graphics card V
 
 
 
-***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 PC. This is the reference machine. You can adapt Verity for your own self-hosted LLM setup.*** 
+***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 Wintel. This is the reference machine. You can adapt Verity for your own self-hosted LLM setup.*** 
 
 
 ---
@@ -23,9 +23,9 @@ Adding "/verify" at the end of an LM Studio query will check answers from one LL
 
 ## How it works at a glance
 
-When you type `/verify`, four things happen at once across two GPUs and the CPU. The **worker** (the LLM you chat with on your strong GPU) is instructed to strictly source all facts. It will now (or should now) claim only what it can validate with a working URL source. No more made up sources, and far fewer made up facts. Then it hands its last answer to a small Node.js process — the MCP server. That server fans the answer out to **two critics** (smaller LLMs on the older GPU that re-read the answer with fresh eyes), an **NLI claim-checker** (a small specialised classifier on the CPU that flags factual contradictions), and a **deterministic recompute pass** (a non-LLM CPU check that catches arithmetic mistakes). Their findings get aggregated into a single pass / warn / fail verdict and pasted back into the chat.
+When you type `/verify`, four things happen at once across two GPUs and the CPU. The **worker** (the LLM you chat with on your strong GPU) is instructed to strictly source all facts. It will now (or should now) claim only what it can validate with a working URL source. No more made up sources, and far fewer made up facts. Then it hands its last answer to a small Node.js process — the MCP server. That server fans the answer out to **two critics** (smaller LLMs on the older GPU that re-read the answer with fresh eyes), an **NLI claim-checker** (a small specialised classifier on the CPU that flags factual contradictions), and a **deterministic recompute pass** (a non-LLM CPU check that catches arithmetic mistakes). Their findings get aggregated into a single pass / warn / fail verdict and pasted back into the chat. Two of those checks are not LLMs — recompute is plain code, NLI is a 0.4 B-parameter encoder transformer that outputs three numbers per claim. 
 
-Two of those checks are not LLMs — recompute is plain code, NLI is a 0.4 B-parameter encoder transformer that outputs three numbers per claim. That's the point: their failure modes don't overlap with the LLM critics, so when they agree there's strong evidence.
+
 
 ---
 
@@ -123,7 +123,7 @@ Phi-4-reasoning was abandoned because its 14 B weights (~8.4 GB) plus the 9 B wo
 
 ---
 
-## Quick start
+## Quick start (Windows)
 
 You need: Node.js 18+, [LM Studio](https://lmstudio.ai/) 0.3.x or newer with MCP client support running on port 1234, and [Ollama](https://ollama.com/) (Vulkan build for AMD GPUs) installed.
 
@@ -239,7 +239,7 @@ NLI = "Natural Language Inference". It's the *task* of taking two sentences and 
 | Bias profile | Shaped by RLHF / instruction tuning | Shaped by SNLI / MNLI / FEVER labels |
 | Cost per call | 100 ms – seconds | ~150 ms |
 
-In the verity, the **premise** is `prior_context` (a document, spec, or earlier chat the answer is supposed to be grounded in) and the **hypothesis** is each claim extracted from the answer. Contradictions are a hard fail signal; "neutral" (= unsupported by the premise) is a soft warn signal that requires 2+ to escalate.
+The **premise** is `prior_context` (a document, spec, or earlier chat the answer is supposed to be grounded in) and the **hypothesis** is each claim extracted from the answer. Contradictions are a hard fail signal; "neutral" (= unsupported by the premise) is a soft warn signal that requires 2+ to escalate.
 
 NLI runs only when prior_context is supplied. The pairwise fallback (each claim against every other claim within the same answer) was tested as zero-signal and is now off by default — see Appendix A.7.
 
@@ -247,17 +247,17 @@ For tricky multi-step entailment that DeBERTa can't reason through, set `NLI_IMP
 
 ### Recompute pass
 
-The cheapest check, and the only one with **100 % precision** when it fires. A regex-based scanner pulls arithmetic, range enumerations, and unit conversions out of the answer; each expression gets evaluated deterministically. If `3 × 5 + 7` doesn't equal what the answer claims, that's a hard fail with no model uncertainty to weigh.
+The cheapest check, and the only one with 100 % precision when it fires. A regex-based scanner pulls arithmetic, range enumerations, and unit conversions out of the answer; each expression gets evaluated deterministically. If `3 × 5 + 7` doesn't equal what the answer claims, that's a hard fail with no model uncertainty to weigh.
 
-The recompute pass also **suppresses** NLI contradictions on expressions it verified correct. This handles the `math-subtle` failure mode where the LLM claim-checker mis-flags arithmetic as contradictory because the textual reasoning gets confused. Determinism wins.
+The recompute pass also suppresses NLI contradictions on expressions it verified correct. This handles the `math-subtle` failure mode where the LLM claim-checker mis-flags arithmetic as contradictory because the textual reasoning gets confused. Determinism wins.
 
 ### Consistency check (deep modes only)
 
 Re-ask the worker the same question 2 (deep) or 5 (deeper) times at temperature 0.7. If the worker contradicts itself across re-samples, that's a sign it was guessing rather than recalling.
 
-The published version of this idea is **SelfCheckGPT** ([Manakul et al., 2023](https://arxiv.org/abs/2303.08896)) — hallucinations tend to be *inconsistent* across re-samples while real knowledge is stable. NLI runs against each re-sample; the divergence score is the fraction of original claims contradicted or unsupported across the alternates.
+The published version of this idea is SelfCheckGPT ([Manakul et al., 2023](https://arxiv.org/abs/2303.08896)) — hallucinations tend to be inconsistent across re-samples while real knowledge is stable. NLI runs against each re-sample; the divergence score is the fraction of original claims contradicted or unsupported across the alternates.
 
-Caveat: catches *low-confidence guessing*, not *consistent overconfidence*. Re-sampling the same model just gives you N samples from the same distribution.
+Caveat: catches low-confidence guessing, not consistent overconfidence. Re-sampling the same model just gives you N samples from the same distribution.
 
 ### Perplexity rescore (deep modes only)
 
@@ -288,7 +288,7 @@ A separate **disputes table** is computed *after* the consensus is decided. It s
 
 ---
 
-## Architecture
+## Architecture (using reference machine) 
 
 A picture of where things run. The strong GPU hosts only the worker; both critics share the older GPU; the NLI classifier runs on the CPU (no GPU dependency). A small Node.js MCP server orchestrates them and exposes a single HTTP endpoint to LM Studio.
 
@@ -322,7 +322,7 @@ A picture of where things run. The strong GPU hosts only the worker; both critic
     └──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Request flow
+### Request process
 
 Step by step, here is what happens after you type `/verify`:
 
@@ -527,7 +527,7 @@ Notes:
 
 ---
 
-## Setup in detail (Windows, reference rig)
+## Setup in detail (Windows, reference machine)
 
 If you're reproducing this on the reference machine, here's the full step-by-step. Adapting to different hardware is in the next section.
 
@@ -632,9 +632,9 @@ The 240 000 ms client timeout matches `PIPELINE_TIMEOUT_MS = 180 000` in `config
 
 ### System prompt for the worker
 
-**Verity is intended to be self-sufficient — you shouldn't need a system prompt for the tools to work, but Qwen is tricky in testing.** The `verify_answer` and `consult_second_opinion` tool descriptions carry all the trigger rules, the mandatory-/verify rule, the strict sourcing contract, and the follow-up (redraft / `/verifydeeper` / no) handling. 
+**Verity is intended to be self-sufficient — you should not need this system prompt for the tools to work, but testing showed that Qwen is tricky.** The `verify_answer` and `consult_second_opinion` tool descriptions carry all the trigger rules, the mandatory-/verify rule, the strict sourcing contract, and the follow-up (redraft / `/verifydeeper` / no) handling. 
 
-The system prompt below is **optional** — use it if you want the worker to operate with a specific persona (here, "investigative journalist"). The persona is customisable — swap for whatever fits your use case. The trigger and behavioural rules below the blank line duplicate what's already in the tool descriptions and are kept here as belt-and-braces:
+The system prompt below is optional — use it if you want the worker to operate with a specific persona (here, "investigative journalist"). The persona is customisable — swap for whatever fits your use case. The trigger and behavioural rules below the blank line duplicate what's already in the tool descriptions and are kept here as belt-and-braces:
 
 ```
 No small talk. All facts are verified. Do not fabricate. You are allowed to scrape websites. You are an assistant to an investigative journalist who examines large tech corporations. Provide URLs that are working (fetch them to check). When stating facts, provide in-line citation to the source in the following format [source number], [author], [publisher], [year], [page number], [url].
