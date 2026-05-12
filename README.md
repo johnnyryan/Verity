@@ -4,9 +4,11 @@ LLMs confidently claim things that are manifestly untrue. Enforce has developed 
 
 Verity can also produce second opinions. If you have a spare old graphics card Verity can use it to produce second opinions at the same time that your primary LLMs responds. Both answers are then considered by your primary LLM. Once adapted for your hardware, you can easily use Verity in LM Studio. We are also sharing our system prompts, which help minimise LLM mistakes even without Verity. 
 
+---
 
 ***The initial setup assumes a Nvidia 5070ti GPU (2025) and and spare AMD 5700xt (2019) on a 2021 PC. This is the reference machine. You can adapt Verity for your own self-hosted LLM setup.*** 
 
+---
 
 ## Basic commands: 
 
