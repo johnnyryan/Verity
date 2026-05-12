@@ -33,15 +33,13 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
 
 **No single check is reliable. The point is that their failure modes don't overlap.** Two LLMs trained on similar data tend to be wrong about the same things — when they agree, they often agree wrong. The NLI classifier was trained on entailment-labelled data instead of helpfulness preferences, so its mistakes look completely different from a chat model's. The recompute pass doesn't have a bias profile at all, because it isn't statistical. When two layers built on different machinery flag the same thing, that is much stronger evidence than any single LLM saying "are you sure?".
 
-```
                               WORKER ANSWER
                        (the LLM you chat with —
                         Qwen 3.5 9B on the strong GPU)
-                                    │
-                                    ▼
+                             
    ┌────────────────────────────────────────────────────────────────────┐
    │ LAYER 1 · Critic A — IBM Granite 8B (LLM)                          │
-   │   How       : different training family from the worker            │
+   |   How       : different training family from the worker            │
    │   Catches   : subtle code bugs, logic flaws, citation errors       │
    │   Blind to  : mistakes the worker's training data also contains    │
    ├────────────────────────────────────────────────────────────────────┤
@@ -76,7 +74,7 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
                                     ▼
                    AGGREGATOR — combines layers into
                        PASS / WARN / FAIL / ERROR
-```
+
 
 The layers are deliberately built on different machinery — a 14 B-class LLM, an 8 B-class LLM from the same family but different scratch corpus, a 0.4 B encoder transformer trained on a different objective, a regex evaluator, a stochastic re-sampler, and a logprob analyser. Six different *kinds* of "wrong" are caught by six different *kinds* of check.
 
@@ -100,26 +98,6 @@ The verity loads four models at the same time. None of them swap during normal o
 
 The reference 
 The 5070 Ti only hosts the worker (~5.5 GB of ~16 GB used). The 5700 XT hosts both critics (~5.8 GB of 8 GB, leaving ~2 GB for KV cache).
-
-### Why each pick
-
-- **Qwen 3.5 9B (worker)** — already running at ~60 tps in LM Studio, strong generalist. No reason to replace it.
-- **IBM Granite 3.2 8B (Critic A, strong)** — different family from Qwen. Catches subtle code bugs the 2B misses (citation detection, off-by-ones, missing null checks). Weight = 2 in the aggregator so a lone 2B fail can't outvote a confident 8B pass.
-- **IBM Granite 3.2 2B (Critic B, fast)** — same vendor as A but distinct training corpus. Phase-3 sweep winner: 144 tok/s warm, 334 ms per critic call, 4/4 correct on the test corpus. Weight = 1.
-- **Family-diversity caveat** — the live panel is "two Granites" rather than the originally-targeted four families. The 8B and 2B were trained from different scratch corpora (per IBM's release notes) but the cross-family axis is now thinner than v1. Re-introducing a non-IBM critic is on the deferred list.
-- **DeBERTa-v3-large cross-encoder (NLI)** — three-class softmax (entailment / contradiction / neutral). ~150 ms per claim on CPU. The original generic MNLI model scored 0/N on the audit corpus; replaced 2026-04-18 with the purpose-built cross-encoder variant.
-
-### Original v1 lineup (superseded — kept for context)
-
-| Role       | Model                    | Family    | Params  | Quant  | VRAM     | Device      |
-| ---------- | ------------------------ | --------- | ------- | ------ | -------- | ----------- |
-| Worker     | Qwen 3.5 9B              | Alibaba   | 9 B     | Q4_K_M | ~6 GB    | 5070 Ti     |
-| Critic A   | Phi-4-reasoning 14B      | Microsoft | 14 B    | Q4_K_M | ~8 GB    | 5070 Ti     |
-| Critic B   | Gemma 4 E2B              | Google    | 5 B tot.| Q4_K_M | ~3.5 GB  | 5700 XT     |
-| Critic C   | Llama 3.2 3B Instruct    | Meta      | 3 B     | Q4_K_M | ~2 GB    | 5700 XT     |
-| NLI check  | DeBERTa-v3-large-mnli    | Microsoft | 0.4 B   | ONNX   | ~1 GB    | iGPU / CPU  |
-
-Phi-4-reasoning was abandoned because its 14 B weights (~8.4 GB) plus the 9 B worker (~5.5 GB) thrashed KV cache on the 16 GB 5070 Ti. Gemma 4 E2B was shortlisted but never deployed; the path went `Phi-4 14B → Phi-3.5-mini → Phi-4-mini → Gemma 3 1B → Granite 3.2`. The 2026-04-17 sweep of 8 small models on AMD Vulkan picked Granite 2B as fastest *and* most accurate. The 8B was added afterward as the strong critic. Full timeline in Appendix A.
 
 ---
 
@@ -164,6 +142,15 @@ Register the MCP server with LM Studio once (Settings → Model Context Protocol
 Then paste the worker's system prompt (see "Setup in detail" below) into your chat-model preset in LM Studio. That tells the worker to call `verify_answer` when you type `/verify`.
 
 Then chat normally and append `/verify` to any message you want re-checked.
+
+## Suggested LM Studio settings (for reference hardware and models) ##
+
+Model settings: 
+Unified KV cache on, K and V cache quant set to Q8, max CPU threads, max practical GPU offload. Offload KV cache to GPU on. Try mmap() on. Keep model in memory on. Flash attention on.
+
+Inference settings: 
+Top K sampling: 40. Temperature: 1. Presence penalty: 1.5. Top P sampling: .95. 
+
 
 ## Starting and stopping 
 
@@ -215,60 +202,6 @@ Modifiers stack: `/verifydeeper as code no-nli with context` is valid. The verdi
 
 ---
 
-## The signals it actually runs
-
-Five different checks contribute to the final verdict. Each catches a different class of mistake, and importantly, they have **non-overlapping failure modes** — when any two agree, that's stronger evidence than two LLMs agreeing because two LLMs share most of their training-data biases.
-
-### Critic LLMs
-
-The two critic models read the worker's answer and emit structured JSON: `{verdict, severity, concerns, suggested_fixes}`. Both run in parallel on the AMD card.
-
-Each critic gets a system prompt tailored to the answer's task type — code review prompts ask different questions than prose prompts. The auto-detector in `prompts.ts` picks the right one unless overridden by `/verify as code` etc.
-
-### NLI claim check (it's not an LLM)
-
-NLI = "Natural Language Inference". It's the *task* of taking two sentences and labelling their relationship as **entailment** ("A implies B"), **contradiction** ("A says not-B"), or **neutral** ("A doesn't address B"). The model doing this job here is a 0.4 B-parameter DeBERTa-v3 transformer fine-tuned on labelled NLI corpora — completely different shape from a chat LLM:
-
-| | Generative LLM (Qwen, Granite) | NLI classifier (DeBERTa) |
-|---|---|---|
-| Architecture | Decoder-only, autoregressive | Encoder-only, single forward pass |
-| Input | A prompt | A sentence pair `[CLS] A [SEP] B [SEP]` |
-| Output | Generated tokens | Three numbers (softmax over 3 classes) |
-| Can hallucinate text? | Yes | **No** — can't emit text. Worst case: wrong label |
-| Determinism | Stochastic by default | Deterministic given fixed weights + input |
-| Bias profile | Shaped by RLHF / instruction tuning | Shaped by SNLI / MNLI / FEVER labels |
-| Cost per call | 100 ms – seconds | ~150 ms |
-
-The **premise** is `prior_context` (a document, spec, or earlier chat the answer is supposed to be grounded in) and the **hypothesis** is each claim extracted from the answer. Contradictions are a hard fail signal; "neutral" (= unsupported by the premise) is a soft warn signal that requires 2+ to escalate.
-
-NLI runs only when prior_context is supplied. The pairwise fallback (each claim against every other claim within the same answer) was tested as zero-signal and is now off by default — see Appendix A.7.
-
-For tricky multi-step entailment that DeBERTa can't reason through, set `NLI_IMPL=llm` to swap it for a Granite critic doing the same job generatively. Slower (~300–600 ms per claim), but capable of chained reasoning.
-
-### Recompute pass
-
-The cheapest check, and the only one with 100 % precision when it fires. A regex-based scanner pulls arithmetic, range enumerations, and unit conversions out of the answer; each expression gets evaluated deterministically. If `3 × 5 + 7` doesn't equal what the answer claims, that's a hard fail with no model uncertainty to weigh.
-
-The recompute pass also suppresses NLI contradictions on expressions it verified correct. This handles the `math-subtle` failure mode where the LLM claim-checker mis-flags arithmetic as contradictory because the textual reasoning gets confused. Determinism wins.
-
-### Consistency check (deep modes only)
-
-Re-ask the worker the same question 2 (deep) or 5 (deeper) times at temperature 0.7. If the worker contradicts itself across re-samples, that's a sign it was guessing rather than recalling.
-
-The published version of this idea is SelfCheckGPT ([Manakul et al., 2023](https://arxiv.org/abs/2303.08896)) — hallucinations tend to be inconsistent across re-samples while real knowledge is stable. NLI runs against each re-sample; the divergence score is the fraction of original claims contradicted or unsupported across the alternates.
-
-Caveat: catches low-confidence guessing, not consistent overconfidence. Re-sampling the same model just gives you N samples from the same distribution.
-
-### Perplexity rescore (deep modes only)
-
-Ask the worker to score its own answer's tokens — how "surprised" was the model by what it just said? Tokens with low log-probability flag spans the worker was hesitant about; those are often where hallucinations hide.
-
-Two strategies, tried in order:
-1. **Forward-pass rescore via `/v1/completions`** with `echo=true, max_tokens=0` — fast (~1–2 s). Works only if LM Studio handles completion-style scoring for the worker model (chat-tuned models sometimes refuse).
-2. **Regenerate with logprobs enabled** (deeper mode only) — re-issue the original question to the worker with `logprobs: true` and capture the logprobs of the freshly generated answer. The new answer may differ from what the user originally saw, but the uncertainty signal is still meaningful. Cost: ~8 s.
-
-If both fail, the signal is skipped with a note. The pipeline gracefully degrades.
-
 ### How the signals combine (aggregator rules)
 
 The aggregator applies fixed rules to combine all signals into a single consensus:
@@ -282,9 +215,9 @@ consistency divergence >= 0.15 or perplexity flagged:   warn
 else:                                                    pass
 ```
 
-When recompute *verified* an arithmetic claim, NLI contradictions whose claim text contains that expression are dropped (handles the `math-subtle` false-positive).
+When recompute verified an arithmetic claim, NLI contradictions whose claim text contains that expression are dropped (handles the `math-subtle` false-positive).
 
-A separate **disputes table** is computed *after* the consensus is decided. It surfaces concerns raised by one critic but not the other (token-Jaccard fuzzy match) plus verdict mismatches. The user always sees disagreement even when the headline verdict is "pass". Disputes never change the verdict — they're a pure diagnostic.
+A separate disputes table is computed after the consensus is decided. It surfaces concerns raised by one critic but not the other (token-Jaccard fuzzy match) plus verdict mismatches. The user always sees disagreement even when the headline verdict is "pass". Disputes never change the verdict — they're a pure diagnostic.
 
 ---
 
