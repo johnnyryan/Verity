@@ -33,10 +33,12 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
 
 **No single check is reliable. The point is that their failure modes don't overlap.** Two LLMs trained on similar data tend to be wrong about the same things — when they agree, they often agree wrong. The NLI classifier was trained on entailment-labelled data instead of helpfulness preferences, so its mistakes look completely different from a chat model's. The recompute pass doesn't have a bias profile at all, because it isn't statistical. When two layers built on different machinery flag the same thing, that is much stronger evidence than any single LLM saying "are you sure?".
 
+```
+
                               WORKER ANSWER
-                       (the LLM you chat with —
-                        Qwen 3.5 9B on the strong GPU)
-                             
+         (the LLM you chat with — Qwen 3.5 9B on the strong GPU)
+                       
+  
    ┌────────────────────────────────────────────────────────────────────┐
    │ LAYER 1 · Critic A — IBM Granite 8B (LLM)                          │
    |   How       : different training family from the worker            │
@@ -70,12 +72,13 @@ When you type `/verify`, four things happen at once across two GPUs and the CPU.
    │   Catches   : tokens the worker was hesitant about                 │
    │   Blind to  : confident hallucinations                             │
    └────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
+                                    
+                                    
                    AGGREGATOR — combines layers into
                        PASS / WARN / FAIL / ERROR
 
 
+```
 The layers are deliberately built on different machinery — a 14 B-class LLM, an 8 B-class LLM from the same family but different scratch corpus, a 0.4 B encoder transformer trained on a different objective, a regex evaluator, a stochastic re-sampler, and a logprob analyser. Six different *kinds* of "wrong" are caught by six different *kinds* of check.
 
 A separate **disputes table** is computed *after* the consensus is decided. It surfaces concerns one critic raised but not the other, so users see disagreement even when the headline verdict is "pass".
