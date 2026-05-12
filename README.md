@@ -15,14 +15,9 @@ Verity can also produce second opinions. If you have a spare old graphics card V
 
 Adding "/verify" at the end of an LM Studio query will check answers from one LLM against different LLMs and an NLI that have been trained in a different way, and have different blind spots. 
 
+"/verifydeep" also repeats the same question x2 (deep) or x5 (deeper) times at higer temperature and checks whether the original claims survive across re-samples. "/verifydeeper" adds scoring of answer tokens, exposing low confidence predictions.
+
 "/second" produces a second opinion and presents differences between LLMs. More commands below. 
-
-Two additional commands: /verifydeep and /verifydeeper, add two more layers of protection. 
-
-/verifydeep repeats the same question x2 (deep) or x5 (deeper) times at higer temperature and checks whether the original claims survive across re-samples.
-
-/verifydeeper scores answer tokens, exposing low confidence predictions.
-
 
 ---
 
