@@ -279,6 +279,7 @@ The prompt also covers the empty case (blank system prompt). The tool descriptio
 - **Hybrid cloud option.** A Groq, Gemini, or Claude call as an extra critic would expand family diversity without local hardware cost. Trade-off: data leaves the device.
 - **A non-IBM critic.** Replace one of the current critics with a Phi-4 or similar at the same memory budget. Restores the cross-family axis.
 - **Bi-encoder NLI pre-filter.** Cheap shortlister for long answers; cross-encoder runs only on the survivors. Cuts NLI cost on long answers in half. Not yet measured.
+- **Try new models.** V
 
 ---
 
