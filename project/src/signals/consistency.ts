@@ -24,7 +24,7 @@ import {
 } from "../config.js";
 import { sampleWorkerN } from "../critics/worker.js";
 import { extractClaims } from "../nli/extract-claims.js";
-import { classifyEntailment } from "../nli/classifier.js";
+import { classifyEntailment, classifyNliLabel } from "../nli/classifier.js";
 import { stripReasoningTraces } from "../sanitize.js";
 import type { ConsistencyResult } from "../types.js";
 
@@ -67,6 +67,11 @@ export async function runConsistencyCheck(params: {
     n: numSamples,
     temperature: CONSISTENCY_TEMPERATURE,
   });
+  // 2026-05-12 (E4): count silently-dropped samples so the notes
+  // string can surface partial failure. If 4 of 5 samples ECONNREFUSED,
+  // the divergence score is computed against the single survivor — a
+  // misleadingly low number. We now log the request/usable ratio.
+  const failedSampleCount = samples.filter((s) => s.error).length;
   const usableSamples = samples
     .map((s) => ({ ...s, text: stripReasoningTraces(s.text) }))
     .filter((s) => s.text.trim().length > 0);
@@ -162,11 +167,12 @@ export async function runConsistencyCheck(params: {
       const r = perSample[i]!;
       if (!r.ok) continue;
       const { label, score } = r;
-      if (label.includes("contradict") && score >= NLI_CONTRADICTION_THRESHOLD) {
+      const kind = classifyNliLabel(label);
+      if (kind === "contradict" && score >= NLI_CONTRADICTION_THRESHOLD) {
         if (!contradictedBy || score > contradictedBy.confidence) {
           contradictedBy = { sample_index: i, confidence: score };
         }
-      } else if (label.includes("entail")) {
+      } else if (kind === "entail") {
         supportedByAtLeastOne = true;
       }
     }
@@ -194,8 +200,12 @@ export async function runConsistencyCheck(params: {
     divergence_score: Number(divergence.toFixed(3)),
     latency_ms: Date.now() - start,
     notes:
-      `Generated ${usableSamples.length} alternate samples at ` +
+      `Generated ${usableSamples.length}/${numSamples} alternate samples at ` +
       `T=${CONSISTENCY_TEMPERATURE}. ` +
+      (failedSampleCount > 0
+        ? `${failedSampleCount} sample(s) failed (errored or empty); divergence ` +
+          `is computed against survivors only. `
+        : "") +
       `${contradicted.length} claim(s) contradicted by an alternate; ` +
       `${unsupported.length} claim(s) not supported by any alternate.`,
   };

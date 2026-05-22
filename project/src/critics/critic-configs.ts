@@ -75,24 +75,33 @@ export interface CriticConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Critic A — Microsoft-family critic on Ollama/Vulkan (AMD 5700 XT)
+// Critic A — the larger / "strong" critic on the weak GPU via Ollama.
 //
-// History (see CRITIC_A_MODEL comment in config.ts for full timeline):
-//   Phi-4 14B on LM Studio/CUDA -> Phi-3.5-mini on Ollama -> Phi-4-mini.
+// History (see CRITIC_A_MODEL comment in config.ts for the full
+// timeline): Phi-4 14B on LM Studio/CUDA → Phi-3.5-mini on Ollama →
+// Phi-4-mini → Granite 3.2 8B → Granite 4.1 8B (current default;
+// pinned via CRITIC_A_MODEL env). The slot is model-agnostic — the
+// `family` field below reflects whatever model is wired up.
 //
-// Phi-4-mini 3.8B (Microsoft, Jan 2025) is the current pick - newer and
-// stronger than Phi-3.5-mini on reasoning benchmarks, same memory footprint.
-// Paired with Nemotron Mini in a 2-critic design that fits the 8 GB AMD
-// card with 8k context per model and room to breathe.
+// Pick the largest critic that still fits alongside Critic B in the
+// weak GPU's VRAM budget. Critic A's job is to catch subtle code
+// bugs, off-by-ones, missing null checks, and citation errors that
+// the smaller Critic B misses. weight = 2 so a lone Critic B "fail"
+// can't outvote a confident Critic A "pass".
 //
-// [ADAPT] contextLimit = 8192 is sized so the critic can ingest a
-// multi-paragraph answer plus moderate prior_context without truncation.
-// Beyond 8k, callCritic() truncates prior_context from the head.
+// [ADAPT] contextLimit is sized so the critic can ingest a multi-
+// paragraph answer plus moderate prior_context without truncation.
+// Beyond contextLimit, callCritic() truncates prior_context from
+// the head. Use the model card's documented native context window;
+// 4 KB / 8 KB are typical for small critics.
 // ─────────────────────────────────────────────────────────────────────────
 export const CRITIC_A: CriticConfig = {
-  // Wire id matches the actual running model (renamed 2026-05-11 from the
-  // legacy "phi4_reasoning"). displayName is the human-facing label.
-  id: "granite_3_2_8b",
+  // Wire id is model-agnostic (renamed 2026-05-20 from the prior
+  // model-specific "granite_3_2_8b" — itself renamed 2026-05-11 from the
+  // legacy "phi4_reasoning"). Decoupling the slot name from the model
+  // means future critic swaps don't require touching three files.
+  // displayName is the human-facing label.
+  id: "critic_a",
   displayName: "Critic A",
   family: "IBM",
   endpoint: OLLAMA_URL,
@@ -104,24 +113,28 @@ export const CRITIC_A: CriticConfig = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Critic B — IBM-family critic on Ollama/Vulkan (AMD 5700 XT)
+// Critic B — the smaller / "fast" critic on the weak GPU via Ollama.
 //
-// Granite 3.2 2B won the Phase-3 sweep of 8 small models on this hardware:
-// 144 tok/s warm, 334 ms per critic call, 4/4 correct on the test suite.
-// That's faster than Phi-4-mini and catches the same errors.
-//
-// IBM's training corpus + instruction tuning are distinct from Microsoft
-// (Phi), NVIDIA (Nemotron), Meta (Llama), and Google (Gemma), so pairing
-// Phi-4-mini + Granite 3.2 gives a real training-family diversity axis.
-//
-// Wire id matches the actual running model (renamed 2026-05-11 from the
-// legacy "nemotron_mini"). VerifyOutput.critics.granite_3_2_2b in types.ts
-// is the matching JSON key.
+// Critic B's job is a quick second voice: catch simple errors, confirm
+// or dissent from Critic A, and provide cross-family diversity. Pick
+// a 1-3 B model from a different training corpus than Critic A (or at
+// minimum a distinct scratch corpus from the same vendor — IBM's 2B
+// and 8B Granites qualified per IBM's release notes). The 2026-04-17
+// Phase-3 sweep selected Granite 3.2 2B (144 tok/s warm, 334 ms per
+// critic call, 4/4 correct on the test corpus). 2026-05-12 the slot
+// was swapped to Ministral 3 3B (Mistral) to restore the cross-family
+// axis (Critic A = IBM, Critic B = Mistral, worker = Qwen). The slot
+// itself is model-agnostic; whatever CRITIC_B_MODEL points at gets
+// loaded. weight = 1.
 // ─────────────────────────────────────────────────────────────────────────
 export const CRITIC_B: CriticConfig = {
-  id: "granite_3_2_2b",
+  // 2026-05-12: critic B is now Ministral-3 3B (Mistral) instead of
+  // Granite 3.2 2B (IBM). 2026-05-20: wire id renamed from the prior
+  // model-specific "granite_3_2_2b" to the model-agnostic "critic_b"
+  // so future model swaps don't drag the wire id with them.
+  id: "critic_b",
   displayName: "Critic B",
-  family: "IBM",
+  family: "Mistral",
   endpoint: OLLAMA_URL,
   apiKey: "ollama",
   model: CRITIC_B_MODEL,
@@ -135,8 +148,10 @@ export const CRITIC_B: CriticConfig = {
 //
 // Dropped from ALL_CRITICS in the 2-critic / 8k-context redesign. Kept
 // as an exported config so a third critic can be re-enabled by adding
-// CRITIC_C back to ALL_CRITICS (and updating MAX_UNAVAILABLE_CRITICS +
-// VerifyOutput.critics.llama32_3b + the findCritic() call in pipeline.ts).
+// CRITIC_C back to ALL_CRITICS (and updating MAX_UNAVAILABLE_CRITICS).
+// VerifyOutput.critics is now a Record<string, CriticResult> keyed by
+// CriticConfig.id, so re-enabling here is a one-file change and the
+// pipeline picks up the new key automatically.
 // Model file is still on disk (`ollama list` shows llama3.2:3b).
 // ─────────────────────────────────────────────────────────────────────────
 export const CRITIC_C: CriticConfig = {

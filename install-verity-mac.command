@@ -7,15 +7,35 @@
 #
 # Default install location is ~/Verity. Override with INSTALL_PATH:
 #   INSTALL_PATH=/wherever ./install-verity-mac.command
+#
+# To install from a fork:
+#   REPO_URL=https://github.com/<you>/Verity.git ./install-verity-mac.command
+# The URL must match the github.com pattern check below.
 
-set -e
+# 2026-05-12: hardened error handling.
+#   set -e: exit on first failed command.
+#   set -u: treat unset variables as errors (no silent "" expansion).
+#   set -o pipefail: a pipeline's exit status is the last non-zero
+#                    command, so `npm install | tail` no longer
+#                    swallows npm failures.
+set -euo pipefail
 
 INSTALL_PATH="${INSTALL_PATH:-$HOME/Verity}"
 REPO_URL="${REPO_URL:-https://github.com/johnnyryan/Verity.git}"
 
-# When double-clicked from Finder, cd to the script's directory so any
-# relative paths work; cd back to HOME so install lands sensibly.
-cd "$(dirname "$0")" >/dev/null 2>&1 || true
+# 2026-05-12: validate REPO_URL pattern. `npm install` runs arbitrary
+# post-install scripts from whatever code we clone; accepting any URL
+# would turn this installer into a remote-code-execution vector. Allow
+# only https github.com URLs by default.
+if [[ ! "$REPO_URL" =~ ^https://github\.com/[^/[:space:]]+/[^/[:space:]]+\.git$ ]]; then
+    echo "[ERROR] REPO_URL must match https://github.com/<owner>/<repo>.git"
+    echo "        got: $REPO_URL"
+    exit 1
+fi
+
+# When double-clicked from Finder, the script's working dir is the
+# script's directory. cd to $HOME so install lands sensibly. (The
+# old extra `cd "$(dirname "$0")"` was a no-op and has been dropped.)
 cd "$HOME"
 
 echo ""

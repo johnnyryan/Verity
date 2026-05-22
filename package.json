@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsc -p project/tsconfig.json && node -e \"try{require('fs').chmodSync('dist/index.js',0o755)}catch(e){}\"",
     "start": "node dist/index.js --transport=http --port=8090",
+    "proxy": "node dist/proxy/server.js",
     "cli": "node dist/cli.js",
     "watch": "tsc -p project/tsconfig.json --watch",
     "test": "tsc -p project/tsconfig.json && node --test dist/__tests__/*.test.js"

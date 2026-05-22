@@ -21,11 +21,13 @@ test("ALL_CRITICS contains the configured fleet (currently 2 critics)", () => {
 });
 
 test("ALL_CRITICS ids match the keys VerifyOutput.critics declares", () => {
-  // Wire ids match the actual running models (renamed 2026-05-11 from the
-  // legacy "phi4_reasoning"/"nemotron_mini" labels which leaked into Qwen
-  // hallucinations even though the real models are Granite 3.2 8B/2B).
+  // Wire ids are model-agnostic (renamed 2026-05-20 from the prior
+  // model-specific "granite_3_2_8b"/"granite_3_2_2b" labels; themselves
+  // renamed 2026-05-11 from the legacy "phi4_reasoning"/"nemotron_mini"
+  // that leaked into Qwen hallucinations). Decoupling slot name from
+  // model means future swaps don't require touching three files.
   const ids = ALL_CRITICS.map((c) => c.id).sort();
-  assert.deepEqual(ids, ["granite_3_2_2b", "granite_3_2_8b"]);
+  assert.deepEqual(ids, ["critic_a", "critic_b"]);
 });
 
 test("MAX_UNAVAILABLE_CRITICS is sized to leave at least one critic to vote", () => {
@@ -34,7 +36,6 @@ test("MAX_UNAVAILABLE_CRITICS is sized to leave at least one critic to vote", ()
   // all-unavailable critics pass through. Pin the relationship.
   // Imported dynamically so a future re-enable of CRITIC_C just needs both
   // numbers updated.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
   return import("../config.js").then(({ MAX_UNAVAILABLE_CRITICS }) => {
     assert.ok(
       MAX_UNAVAILABLE_CRITICS < ALL_CRITICS.length,
@@ -56,23 +57,24 @@ test("each critic has the required fields", () => {
   }
 });
 
-test("displayName reflects the actual running model", () => {
-  // The displayName is what the human-readable renderer pastes into the
-  // critic table. Wire ids were renamed to match the model on 2026-05-11
-  // (granite_3_2_8b / granite_3_2_2b), so id+displayName should agree.
-  const byId = Object.fromEntries(ALL_CRITICS.map((c) => [c.id, c.displayName]));
-  if (byId.granite_3_2_8b !== undefined) {
+test("displayName is a non-empty human-readable label", () => {
+  // 2026-05-12: the displayName used to be tied to a specific model
+  // ("IBM Granite 3.2 8B") and a regex matched on "granite". That tied
+  // the test to the live roster; Johnny's "treat models as
+  // placeholders" directive moved displayNames to role-only labels
+  // ("Critic A", "Critic B"). Test now checks the contract that
+  // matters: displayName exists and isn't just the wire id leaking
+  // through.
+  for (const cfg of ALL_CRITICS) {
     assert.ok(
-      /granite/i.test(byId.granite_3_2_8b),
-      `granite_3_2_8b displayName must name the actual model ` +
-        `(got "${byId.granite_3_2_8b}")`
+      cfg.displayName && cfg.displayName.trim().length > 0,
+      `displayName must be a non-empty string for ${cfg.id}`
     );
-  }
-  if (byId.granite_3_2_2b !== undefined) {
-    assert.ok(
-      /granite/i.test(byId.granite_3_2_2b),
-      `granite_3_2_2b displayName must name the actual model ` +
-        `(got "${byId.granite_3_2_2b}")`
+    assert.notEqual(
+      cfg.displayName,
+      cfg.id,
+      `displayName must differ from the wire id for ${cfg.id}` +
+        ` (got "${cfg.displayName}")`
     );
   }
 });

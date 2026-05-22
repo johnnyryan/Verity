@@ -26,7 +26,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import {
+  MAX_ANSWER_CHARS,
+  MAX_PRIOR_CONTEXT_CHARS,
+  MAX_QUESTION_CHARS,
+  MAX_REQUEST_BYTES,
   NLI_IMPL,
+  SERVER_HOST,
   SERVER_PORT,
   SESSION_IDLE_TIMEOUT_MS,
   SESSION_SWEEP_INTERVAL_MS,
@@ -83,74 +88,40 @@ const TOOL_LISTING = {
     {
       name: "verify_answer",
       description:
-        "Audits an answer with critic models + NLI claim-checking. The " +
-        "answer to audit is the `answer` parameter you pass to this tool " +
-        "— typically the prose you JUST composed in the current turn, " +
-        "NOT something from prior chat history. Returns a ready-to-paste " +
-        "Markdown block containing the answer (echoed back), the critic " +
-        "verdicts table, findings, and a follow-up prompt.\n" +
+        "Audits an answer with critic models + NLI claim-check. Returns " +
+        "a ready-to-paste Markdown block (answer echoed, verdict table, " +
+        "findings, follow-up prompt).\n" +
         "\n" +
-        "WHEN TO CALL: the user typed '/verify', '/verifydeep', or " +
-        "'/verifydeeper' anywhere in their latest message. /verify is a " +
-        "TOOL TRIGGER — it means call this tool, not 'write a verified " +
-        "answer in prose'. Map: /verify→mode='standard', /verifydeep→" +
-        "'deep', /verifydeeper→'deeper'.\n" +
+        "WHEN TO CALL: user typed `/verify`, `/verifydeep`, or " +
+        "`/verifydeeper` in their latest message. Map to mode=standard / " +
+        "deep / deeper.\n" +
         "\n" +
-        "ALSO CALL when your prior turn pasted a Verity block that " +
-        "ended with the 'Awaiting your reply' prompt AND the user " +
-        "replied with '/verifydeeper', 'deeper', 'yes', 'OK', 'sure', " +
-        "'go ahead' — that affirmative means mode='deeper' on the same " +
-        "answer.\n" +
+        "ALSO CALL when your last assistant turn was a Verity block " +
+        "ending with the 'Awaiting your reply' prompt and the user " +
+        "replied affirmatively (yes / OK / `/verifydeeper` / sure) — " +
+        "call with mode='deeper'. If the user replied 'redraft', " +
+        "rewrite the answer (fetch-verifying every URL — do not " +
+        "fabricate sources) then call this tool again on the rewrite. " +
+        "If they replied 'no', do nothing.\n" +
         "\n" +
-        "If the user replies 'redraft', rewrite the answer to address " +
-        "the findings, then call this tool again on the rewritten " +
-        "answer. The same STRICT SOURCING CONTRACT applies to the " +
-        "redraft: every URL in the redraft MUST be fetched first via " +
-        "the fetch tool to confirm it resolves. Do NOT 'address' a " +
-        "'needs more sources' finding by adding plausible-looking " +
-        "URLs you haven't fetched — that is fabrication and makes the " +
-        "redraft worse than the original. If you can't find a working " +
-        "source for a claim, drop the claim from the redraft.\n" +
+        "FLOW for `/verify` on a fresh question:\n" +
+        "  1. Write a substantive prose answer. Back non-trivial claims " +
+        "with fetched URLs cited as [N], [author], [publisher], [year], " +
+        "[page], [url]. Drop claims you can't source.\n" +
+        "  2. Call verify_answer with question + your prose answer.\n" +
+        "  3. Paste the returned Markdown block verbatim into chat. LM " +
+        "Studio collapses tool results by default; the user only sees " +
+        "what's in your assistant message body.\n" +
+        "  4. Stop. The block has its own follow-up prompt; wait for " +
+        "the user's reply, do not redraft unprompted.\n" +
         "\n" +
-        "Reply 'no' means do nothing.\n" +
-        "\n" +
-        "FLOW for an inline '/verify' trigger:\n" +
-        "  1. Write a substantive prose answer (a paragraph or more) " +
-        "to the user's question. For non-trivial factual claims, use " +
-        "the fetch tool to confirm 3-7 working source URLs, then cite " +
-        "inline as [N], [author], [publisher], [year], [page], [url]. " +
-        "Drop facts you can't source; do not invent URLs.\n" +
-        "  2. Call verify_answer with question + answer (the " +
-        "full prose from step 1, not a summary or placeholder).\n" +
-        "  3. The tool returns a Markdown block. PASTE THE ENTIRE BLOCK " +
-        "VERBATIM into your chat reply. LM Studio collapses tool-call " +
-        "results by default, so the user only sees what is in your " +
-        "message body. The block itself starts with the answer echoed " +
-        "back, then the table, then findings. The block also tells you " +
-        "not to redraft — follow that.\n" +
-        "  4. Stop. The block ends with a yes/no follow-up prompt for " +
-        "the user; wait for their reply, do not redraft on your own.\n" +
-        "\n" +
-        "DO NOT: skip the tool call (writing prose with citations is " +
-        "NOT a substitute); paraphrase the block (paste verbatim); " +
-        "redraft the answer based on findings (the block already asks " +
-        "the user about redrafting); invent the table from your own " +
-        "reasoning (the table comes from the tool, not from you).",
-      // Older verbose description was 18k chars / 297 lines (2026-05-11
-      // afternoon). That length fragmented Qwen 3.5 9B's attention and
-      // produced unreliable behaviour. Trimmed to ~2.5k chars / 40
-      // lines (v4 evening). The agent-preface inside the rendered
-      // block carries the "do not redraft / paste verbatim" rules
-      // co-located with the data.
+        "DO NOT: skip the tool call when /verify was typed; paraphrase " +
+        "the block (paste verbatim); redraft without explicit user " +
+        "consent; invent the verdict table from your own reasoning.",
+      // Tool description history (length tunings, schema simplifications)
+      // is recorded in design.md → "Change log". Substantive guidance for
+      // operators lives there, not inline.
       inputSchema: {
-        // 2026-05-11 v3 simplification: reduced from 7 params to 4 to
-        // make tool calls more reliable. Smaller models (Qwen 3.5 9B)
-        // were intermittently dropping the "parameter=" prefix on one
-        // param when the schema had many fields — observed failure:
-        //   <prior_context> none </parameter>
-        // (missing the parameter= prefix). Fewer params = fewer chances
-        // for the generator to glitch.
-        //
         // Hidden but still server-controlled:
         //   task_type   — always "auto" (server auto-detects code vs
         //                 prose vs reasoning vs research).
@@ -322,24 +293,73 @@ async function handleToolCall(
       );
     }
 
-    // Derive the previously-exposed schema params from sensible defaults
-    // (see inputSchema comment for rationale): task_type=auto always,
-    // use_nli=true always, context_mode is derived from prior_context.
-    // We still honour them if a caller passes them via the unstable
-    // back-channel (older clients, direct HTTP testers).
+    // 2026-05-12 (B1): per-field length caps. The worker is untrusted
+    // (passes arbitrary strings via MCP). Anything past these limits
+    // would get truncated by callCritic's fitToContext anyway and the
+    // latency cost is borne by the verity process — cleaner to reject
+    // up front with a clear error.
+    if (args.question.length > MAX_QUESTION_CHARS) {
+      throw new Error(
+        `verify_answer: 'question' exceeds ${MAX_QUESTION_CHARS} chars ` +
+          `(got ${args.question.length})`
+      );
+    }
+    if (args.answer.length > MAX_ANSWER_CHARS) {
+      throw new Error(
+        `verify_answer: 'answer' exceeds ${MAX_ANSWER_CHARS} chars ` +
+          `(got ${args.answer.length})`
+      );
+    }
+    if (
+      typeof args.prior_context === "string" &&
+      args.prior_context.length > MAX_PRIOR_CONTEXT_CHARS
+    ) {
+      throw new Error(
+        `verify_answer: 'prior_context' exceeds ${MAX_PRIOR_CONTEXT_CHARS} ` +
+          `chars (got ${args.prior_context.length})`
+      );
+    }
+
+    // 2026-05-12 (E1): validate enum membership for mode / task_type /
+    // context_mode before casting. The previous `as TaskType` etc.
+    // bypassed validation entirely — a caller passing
+    // `task_type: "rm -rf"` reached the pipeline unchecked. Bad values
+    // now fall back to the default rather than poisoning downstream
+    // prompt selection.
+    const VALID_MODES = new Set(["standard", "deep", "deeper"] as const);
+    const VALID_TASK_TYPES = new Set(
+      ["code", "prose", "reasoning", "research", "auto"] as const
+    );
+    const VALID_CONTEXT_MODES = new Set(
+      ["minimal", "with_context", "full"] as const
+    );
     const argsRecord = args as Record<string, unknown>;
+    const mode = VALID_MODES.has(args.mode as never)
+      ? (args.mode as "standard" | "deep" | "deeper")
+      : "standard";
+    const rawTaskType = argsRecord.task_type;
+    const taskType: TaskType = VALID_TASK_TYPES.has(rawTaskType as never)
+      ? (rawTaskType as TaskType)
+      : "auto";
     const hasPriorContext =
       typeof args.prior_context === "string" && args.prior_context.trim().length > 0;
+    const rawContextMode = argsRecord.context_mode;
+    const contextMode: ContextMode = VALID_CONTEXT_MODES.has(
+      rawContextMode as never
+    )
+      ? (rawContextMode as ContextMode)
+      : hasPriorContext
+        ? "with_context"
+        : "minimal";
+
     const result = await runVerificationPipeline({
       question: args.question,
       answer: args.answer,
-      mode: args.mode ?? "standard",
-      task_type: (argsRecord.task_type as TaskType) ?? "auto",
-      context_mode:
-        (argsRecord.context_mode as ContextMode) ??
-        (hasPriorContext ? "with_context" : "minimal"),
+      mode,
+      task_type: taskType,
+      context_mode: contextMode,
       prior_context: hasPriorContext ? args.prior_context : undefined,
-      use_nli: (argsRecord.use_nli as boolean | undefined) ?? true,
+      use_nli: argsRecord.use_nli === false ? false : true,
     });
 
     // Send the pre-rendered Markdown summary as the primary tool-response
@@ -347,10 +367,17 @@ async function handleToolCall(
     // chat; returning the JSON-stringified VerifyOutput made them dump
     // raw JSON. Returning summary_md means whatever the worker pastes is
     // already a clean Markdown table -- no extraction step required.
+    // 2026-05-20: previous fallback dumped the entire raw VerifyOutput as
+    // JSON when summary_md happened to be empty. That dump leaked the
+    // structured payload into chat (including any LLM-side internals the
+    // critics returned) and was almost never what the user wanted. Use
+    // a short canned message instead; the structured fields are still
+    // available via the MCP resource path for callers that need them.
+    const text =
+      result.summary_md ||
+      "Verification result was empty; see structured fields for details.";
     return {
-      content: [
-        { type: "text" as const, text: result.summary_md || JSON.stringify(result, null, 2) },
-      ],
+      content: [{ type: "text" as const, text }],
     };
   }
 
@@ -358,6 +385,31 @@ async function handleToolCall(
     const args = (request.params.arguments ?? {}) as Partial<ConsultInput>;
     if (typeof args.question !== "string") {
       throw new Error("consult_second_opinion requires a 'question' string");
+    }
+    // 2026-05-12 (B1): same per-field caps as verify_answer.
+    if (args.question.length > MAX_QUESTION_CHARS) {
+      throw new Error(
+        `consult_second_opinion: 'question' exceeds ${MAX_QUESTION_CHARS} ` +
+          `chars (got ${args.question.length})`
+      );
+    }
+    if (
+      typeof args.worker_draft === "string" &&
+      args.worker_draft.length > MAX_ANSWER_CHARS
+    ) {
+      throw new Error(
+        `consult_second_opinion: 'worker_draft' exceeds ${MAX_ANSWER_CHARS} ` +
+          `chars (got ${args.worker_draft.length})`
+      );
+    }
+    if (
+      typeof args.prior_context === "string" &&
+      args.prior_context.length > MAX_PRIOR_CONTEXT_CHARS
+    ) {
+      throw new Error(
+        `consult_second_opinion: 'prior_context' exceeds ` +
+          `${MAX_PRIOR_CONTEXT_CHARS} chars (got ${args.prior_context.length})`
+      );
     }
     const resolution_mode =
       args.resolution_mode === "auto" ? "auto" : "manual";
@@ -472,7 +524,11 @@ function renderConsultMarkdown(
 // ═══════════════════════════════════════════════════════════════════════════
 
 const app = express();
-app.use(express.json({ limit: "50mb" }));
+// 2026-05-12: was "50mb". The worker model is untrusted (passes
+// arbitrary strings via MCP), and the previous limit invited trivial
+// DoS via one huge `answer`. MAX_REQUEST_BYTES defaults to 4 MB; raise
+// via VERITY_MAX_REQUEST_BYTES if you genuinely need bigger payloads.
+app.use(express.json({ limit: MAX_REQUEST_BYTES }));
 
 // Health check — useful for `curl http://localhost:8090/health`.
 app.get("/health", (_req, res) => {
@@ -491,7 +547,10 @@ app.get("/health", (_req, res) => {
 // can reclaim sessions that disconnected without firing onclose (network
 // blip, LM Studio restart, browser tab closed).
 //
-// [ADAPT] If LM Studio uses a different session header key, adjust here.
+// Header key is `mcp-session-id` because that is what the MCP HTTP
+// transport spec defines; clients (LM Studio, MCP CLI, anything that
+// speaks the protocol) are expected to send this exact header. Not
+// configurable.
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   lastActivity: number;
@@ -561,11 +620,19 @@ app.all("/mcp", async (req, res) => {
   }
 });
 
-app.listen(SERVER_PORT, () => {
+app.listen(SERVER_PORT, SERVER_HOST, () => {
+  // Logging convention: this file (and the rest of Verity) uses
+  // `console.error` for all server-side diagnostic output even on the
+  // HTTP transport. That's the historical stdio-MCP convention (stdout
+  // is reserved for the JSON-RPC channel) and is preserved here for
+  // consistency, even though on HTTP transport stdout is unused and
+  // would be acceptable too. If a structured logger is ever added,
+  // swap every `console.error` together so the convention stays
+  // uniform across stdio + HTTP code paths.
   console.error(
-    `[verity] MCP server v${SERVER_VERSION} listening on http://localhost:${SERVER_PORT}/mcp`
+    `[verity] MCP server v${SERVER_VERSION} listening on http://${SERVER_HOST}:${SERVER_PORT}/mcp`
   );
-  console.error(`[verity] health check at http://localhost:${SERVER_PORT}/health`);
+  console.error(`[verity] health check at http://${SERVER_HOST}:${SERVER_PORT}/health`);
 
   // Non-blocking boot warmup. Pays the ONNX cold-load + tiktoken-init costs
   // off the request hot path so the first /verify call hits warm caches.

@@ -17,7 +17,7 @@
  * process lifetime.
  */
 
-import { pipeline, env } from "@huggingface/transformers";
+import { pipeline, env, type TextClassificationPipeline } from "@huggingface/transformers";
 
 import {
   NLI_MODEL_ID,
@@ -43,22 +43,35 @@ env.allowLocalModels = true;
 
 // Lazily-initialized classifier. First call downloads the model (~1 GB),
 // subsequent calls use the in-memory instance.
-let classifierPromise: Promise<any> | null = null;
+//
+// 2026-05-12 (E3): we cache the promise only on success. The previous
+// implementation cached the promise unconditionally, including a
+// rejected one. A single transient failure (cold-load OOM, download
+// interrupted, model file corrupt) would poison every subsequent
+// call with the cached rejection. Now: on failure we clear the cache
+// so the next caller gets a clean retry.
+let classifierPromise: Promise<TextClassificationPipeline> | null = null;
 
-function getClassifier(): Promise<any> {
-  if (!classifierPromise) {
-    if (VERBOSE_LOGGING) {
-      console.error(`[NLI] Loading ${NLI_MODEL_ID} on device=${NLI_DEVICE}`);
-    }
-    // "text-classification" with an NLI model returns entailment /
-    // contradiction / neutral labels when given a "premise [SEP] hypothesis"
-    // pair. Some models prefer a different format — see the model card if
-    // you swap NLI_MODEL_ID.
-    classifierPromise = pipeline("text-classification", NLI_MODEL_ID, {
-      device: NLI_DEVICE,
-    });
+function getClassifier(): Promise<TextClassificationPipeline> {
+  if (classifierPromise) return classifierPromise;
+  if (VERBOSE_LOGGING) {
+    console.error(`[NLI] Loading ${NLI_MODEL_ID} on device=${NLI_DEVICE}`);
   }
-  return classifierPromise;
+  // "text-classification" with an NLI model returns entailment /
+  // contradiction / neutral labels when given a "premise [SEP] hypothesis"
+  // pair. Some models prefer a different format — see the model card if
+  // you swap NLI_MODEL_ID.
+  const pending = pipeline("text-classification", NLI_MODEL_ID, {
+    device: NLI_DEVICE,
+  });
+  classifierPromise = pending;
+  pending.catch(() => {
+    // Cache invalidation: only clear if THIS pending promise is the
+    // one in the cache slot. A successful concurrent load would have
+    // replaced classifierPromise; we must not stamp it back to null.
+    if (classifierPromise === pending) classifierPromise = null;
+  });
+  return pending;
 }
 
 /**
@@ -122,7 +135,13 @@ async function classifyPairAll(
   const classifier = await getClassifier();
 
   // top_k: null asks transformers.js to return every label's score.
-  const result = await classifier([premise, hypothesis], { top_k: null });
+  // The library accepts null at runtime but the d.ts only types it as
+  // `number | undefined`; cast to satisfy the compiler without altering
+  // behaviour.
+  const result = await classifier(
+    [premise, hypothesis],
+    { top_k: null as unknown as number | undefined }
+  );
 
   // Result shape for pairwise text-classification with top_k:null is
   // [ [ {label, score}, {label, score}, {label, score} ] ] — batch of 1.
@@ -154,13 +173,33 @@ async function classifyPairAll(
 }
 
 /**
+ * Map a raw NLI label string to a coarse bucket.
+ *
+ * Label names differ by model: "contradiction", "CONTRADICTION",
+ * "contradict", "CONTRADICT", "ENTAILMENT", "entailment", "entail",
+ * "neutral", and even "LABEL_0/1/2" in some cases. We match loosely
+ * on the substrings "contradict" and "entail"; anything else falls
+ * through to "neutral".
+ *
+ * Exported so consistency.ts can use the same dispatch rules as the
+ * classifier — duplicating `label.includes("contradict")` etc. was
+ * making two files own NLI label semantics.
+ */
+export function classifyNliLabel(
+  label: string
+): "contradict" | "entail" | "neutral" {
+  const l = label.toLowerCase();
+  if (l.includes("contradict")) return "contradict";
+  if (l.includes("entail")) return "entail";
+  return "neutral";
+}
+
+/**
  * Extract the contradiction probability from the all-label map.
- * Label names differ by model: "contradiction", "CONTRADICTION", "contradict",
- * "CONTRADICT", "LABEL_0" in some cases. We match loosely.
  */
 function contradictionScore(all: Record<string, number>): number {
   for (const [label, score] of Object.entries(all)) {
-    if (label.includes("contradict")) return score;
+    if (classifyNliLabel(label) === "contradict") return score;
   }
   return 0;
 }
@@ -170,13 +209,21 @@ function contradictionScore(all: Record<string, number>): number {
  */
 function entailmentScore(all: Record<string, number>): number {
   for (const [label, score] of Object.entries(all)) {
-    if (label.includes("entail")) return score;
+    if (classifyNliLabel(label) === "entail") return score;
   }
   return 0;
 }
 
 /**
  * Entailment check: is each claim supported by the premise?
+ *
+ * 2026-05-12 (E5): claim classification now fans out in parallel via
+ * Promise.all. The consistency signal already parallelised
+ * claim × sample pairs; doing this serially here was the dominant
+ * cost on premise-bearing /verify calls (especially `with context`
+ * where NLI_MAX_CLAIMS can be 14+). The ONNX runtime serialises at
+ * the model level anyway, but JS-side awaits between turns add up.
+ * On a 14-claim load this typically halves NLI wall-clock.
  */
 async function checkEntailment(
   premise: string,
@@ -185,30 +232,33 @@ async function checkEntailment(
   const contradictions: NliResult["contradictions"] = [];
   const unsupported: NliResult["unsupported"] = [];
 
-  for (const claim of claims) {
-    try {
-      const { top, all } = await classifyPairAll(premise, claim);
-      const cScore = contradictionScore(all);
-      const eScore = entailmentScore(all);
-
-      // Explicit contradiction: use the contradict label's score directly,
-      // even if "neutral" happened to win the top-1 race.
-      if (cScore >= NLI_CONTRADICTION_THRESHOLD) {
-        contradictions.push({
+  const perClaim = await Promise.all(
+    claims.map(async (claim) => {
+      try {
+        const { all } = await classifyPairAll(premise, claim);
+        return {
           claim,
-          premise_snippet: premise.slice(0, 200),
-          confidence: cScore,
-        });
-      } else if (eScore < NLI_CONTRADICTION_THRESHOLD) {
-        // Not confidently entailed → unsupported.
-        // (keeps behaviour similar to the old "neutral = unsupported" rule
-        // but driven by the entailment score rather than top-1 label.)
-        unsupported.push({ claim });
+          cScore: contradictionScore(all),
+          eScore: entailmentScore(all),
+        };
+      } catch (err) {
+        if (VERBOSE_LOGGING) console.error("[NLI] classifyPair error:", err);
+        return null;
       }
-      void top;
-    } catch (err) {
-      if (VERBOSE_LOGGING) console.error("[NLI] classifyPair error:", err);
-      // Skip this claim, keep going.
+    })
+  );
+
+  for (const r of perClaim) {
+    if (!r) continue;
+    if (r.cScore >= NLI_CONTRADICTION_THRESHOLD) {
+      contradictions.push({
+        claim: r.claim,
+        premise_snippet: premise.slice(0, 200),
+        confidence: r.cScore,
+      });
+    } else if (r.eScore < NLI_CONTRADICTION_THRESHOLD) {
+      // Not confidently entailed → unsupported.
+      unsupported.push({ claim: r.claim });
     }
   }
 

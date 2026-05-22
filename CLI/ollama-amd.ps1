@@ -49,7 +49,15 @@ param(
     # Heavier hammer: restrict the Vulkan loader to AMD's ICD only.
     # Used automatically as a retry if the first start lands on NVIDIA;
     # set manually to skip the retry and use it on first attempt.
-    [switch]$ForceAmdVulkanDriver
+    [switch]$ForceAmdVulkanDriver,
+
+    # 2026-05-12 (E18): skip the synchronous probe model load that
+    # confirms Ollama landed on AMD. The probe issues a 60-second
+    # /api/generate that cold-loads granite3.2:8b on first run, which
+    # can wedge the launcher for the full timeout. Set this when you
+    # already know AMD pinning works on this machine and you want
+    # the launcher to return as soon as `ollama serve` binds.
+    [switch]$SkipProbe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -164,6 +172,10 @@ function Get-OllamaInferenceBackend {
     if ($line -match 'library=CUDA') {
         return @{ Library = 'CUDA'; Device = 'NVIDIA'; OnAmd = $false; OnNvidia = $true }
     }
+    # The 'inference compute' line is present but neither regex matched it.
+    # Ollama may have changed its stderr format; surface that so the operator
+    # knows GPU placement detection has gone blind.
+    Write-Log "Get-OllamaInferenceBackend: 'inference compute' line found but did not match either regex. Ollama stderr format may have changed. Line: $line" 'WARN'
     return $null
 }
 
@@ -216,9 +228,16 @@ function Get-AmdVulkanIcd {
     Get-ChildItem -Path $displayClass -ErrorAction SilentlyContinue | ForEach-Object {
         $key = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
         if ($null -ne $key.VulkanDriverName -and $key.VulkanDriverName -ne '' -and $key.DriverDesc) {
+            # 2026-05-12 (E16): some drivers register MULTIPLE ICD paths
+            # as a string array on VulkanDriverName. Casting to [string]
+            # would join them with whitespace, producing a Test-Path call
+            # that always returns false. Take the first array element
+            # explicitly so a multi-ICD driver still resolves cleanly.
+            $rawIcd = $key.VulkanDriverName
+            $firstIcd = if ($rawIcd -is [array]) { [string]$rawIcd[0] } else { [string]$rawIcd }
             $candidates += [PSCustomObject]@{
                 Desc = [string]$key.DriverDesc
-                Icd  = [string]$key.VulkanDriverName
+                Icd  = $firstIcd
             }
         }
     }
@@ -342,7 +361,11 @@ function Action-Start {
     # Idempotency: if a serve is already up, decide whether to no-op or restart
     $existing = Get-OllamaServePids
     if ($existing) {
+        if ($SkipProbe) {
+        Write-Log 'Skipping Probe-LoadModel (-SkipProbe set).'
+    } else {
         $null = Probe-LoadModel
+    }
         $gpu = Get-OllamaOnNvidia
         if ($gpu.OnNvidia) {
             Write-Log 'Ollama is running but on NVIDIA. Restarting on AMD.' 'WARN'
@@ -393,7 +416,11 @@ function Action-Start {
     Write-Log 'Ollama responding on :11434.' 'OK'
 
     # Verify GPU placement with a real model probe
-    $null = Probe-LoadModel
+    if ($SkipProbe) {
+        Write-Log 'Skipping Probe-LoadModel (-SkipProbe set).'
+    } else {
+        $null = Probe-LoadModel
+    }
     $gpu = Get-OllamaOnNvidia
     if ($gpu.OnNvidia) {
         Write-Log 'GPU check FAILED -- Ollama landed on NVIDIA despite VK_DRIVER_FILES restriction:' 'ERROR'
@@ -415,11 +442,38 @@ function Action-Start {
     Show-Status
 }
 
-# Pre-warm both Granite critics so /verify's first call doesn't pay
+# Pre-warm both critic models so /verify's first call doesn't pay
 # cold-load latency. ~12 s total on a fresh Ollama; subsequent verify
 # calls are fast because the runners stay resident for OLLAMA_KEEP_ALIVE.
+#
+# 2026-05-12 (E15): was hardcoded `@('granite3.2:8b', 'granite3.2:2b')`.
+# Whenever critic-configs.ts changed (model swap, new vendor), the
+# launcher silently warmed the wrong models — costing the cold-load
+# latency on the FIRST real /verify call. Now reads the tags from
+# Ollama's /api/tags. Falls back to the historical pair if the API
+# is unreachable, so the launcher never blocks on this step.
+function Get-WarmupTargets {
+    try {
+        $tags = Invoke-RestMethod -Uri 'http://localhost:11434/api/tags' -TimeoutSec 5
+        if ($tags.models -and $tags.models.Count -gt 0) {
+            $candidates = $tags.models | Where-Object {
+                $_.name -notlike '*embed*' -and $_.name -notlike '*nomic*'
+            }
+            if ($candidates -and $candidates.Count -ge 1) {
+                # Warm the smallest 2 models (typical critic shape).
+                return ($candidates | Sort-Object size | Select-Object -First 2 -ExpandProperty name)
+            }
+        }
+    } catch {
+        Write-Log "Could not query Ollama for warmup targets: $_" 'WARN'
+    }
+    # Fallback to known-good defaults.
+    return @('granite3.2:8b', 'granite3.2:2b')
+}
+
 function Warm-CriticModels {
-    $critics = @('granite3.2:8b', 'granite3.2:2b')
+    $critics = Get-WarmupTargets
+    Write-Log ("Warming: " + ($critics -join ', '))
     foreach ($model in $critics) {
         Write-Log "Pre-warming $model ..."
         $body = @{
@@ -450,7 +504,11 @@ function Action-Verify {
         Write-Log 'Ollama is not running. Nothing to verify.' 'WARN'
         exit 1
     }
-    $null = Probe-LoadModel
+    if ($SkipProbe) {
+        Write-Log 'Skipping Probe-LoadModel (-SkipProbe set).'
+    } else {
+        $null = Probe-LoadModel
+    }
     $gpu = Get-OllamaOnNvidia
     if ($gpu.OnNvidia) {
         Write-Log 'GPU check FAILED -- Ollama on NVIDIA.' 'ERROR'

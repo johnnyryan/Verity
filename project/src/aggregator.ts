@@ -9,9 +9,13 @@
  *   - Elif any critic severity >= WARN_SEVERITY_THRESHOLD → warn
  *   - Elif NLI finds unsupported claims → warn
  *   - Elif consistency divergence >= CONSISTENCY_WARN_THRESHOLD → warn
- *   - Elif perplexity flagged any low-confidence spans → warn
  *   - Elif too many critics unavailable → error
  *   - Else → pass
+ *
+ * The logprob perplexity / model-uncertainty signal is ADVISORY only: it is
+ * surfaced as a nudge but never flips the consensus (2026-05-22). It is blind
+ * to fluent hallucinations and noisy on rare-but-correct wording, so the
+ * consistency check is the deep-mode hallucination spine.
  *
  * [ADAPT] If you want weighted voting (e.g. Phi-4 counts 2x because it's
  * the strongest critic), or if you want consistency to be a stronger
@@ -19,13 +23,22 @@
  */
 
 import {
+  AGGREGATOR_WEIGHTED_VOTE,
   FAIL_SEVERITY_THRESHOLD,
   WARN_SEVERITY_THRESHOLD,
   MAX_UNAVAILABLE_CRITICS,
   CONSISTENCY_FAIL_THRESHOLD,
   CONSISTENCY_WARN_THRESHOLD,
   NLI_IMPL,
+  RENDER_CELL_TOPIC_CHARS,
+  RENDER_CELL_CONCERN_CHARS,
+  RENDER_FINDING_CONCERN_CHARS,
+  RENDER_FINDING_EXTRA_CHARS,
+  RENDER_FINDING_NLI_CLAIM_CHARS,
+  RENDER_FINDING_RECOMPUTE_CHARS,
+  SUMMARY_ECHO_ANSWER,
 } from "./config.js";
+import { CHECK_CHIPS, VERDICT_CHIPS } from "./render-constants.js";
 import type {
   ConsistencyResult,
   CriticResult,
@@ -92,10 +105,26 @@ export function computeDisputes(critics: CriticResult[]): Disagreement[] {
   );
   if (usable.length < 2) return [];
 
-  const a = usable[0];
-  const b = usable[1];
+  // 2026-05-12 (E10): previously this function only inspected
+  // usable[0] and usable[1] — disagreement from a third critic was
+  // silently dropped. With the 2-critic panel that was a no-op, but
+  // any future return to a 3-critic fleet would re-introduce the
+  // blind spot. Now: fan out across every pair (a, b) where index
+  // a < b, so disputes from any pairing are surfaced.
   const disputes: Disagreement[] = [];
+  for (let i = 0; i < usable.length; i++) {
+    for (let j = i + 1; j < usable.length; j++) {
+      collectPairDisputes(usable[i], usable[j], disputes);
+    }
+  }
+  return disputes;
+}
 
+function collectPairDisputes(
+  a: CriticResult,
+  b: CriticResult,
+  disputes: Disagreement[]
+): void {
   // ── Verdict mismatch ─────────────────────────────────────────────────
   if (a.verdict !== b.verdict) {
     const straddlesShipHalt =
@@ -165,8 +194,6 @@ export function computeDisputes(critics: CriticResult[]): Disagreement[] {
       });
     }
   }
-
-  return disputes;
 }
 
 export function aggregate(
@@ -216,7 +243,6 @@ export function aggregate(
   // verify against premise", not "contradicts premise", and are orthogonal
   // to whether arithmetic checks out.
   const recompute = deep?.recompute;
-  const recomputeMismatches = recompute?.mismatches?.length ?? 0;
   const verifiedExprs =
     recompute?.verifications
       ?.filter((v) => v.matches)
@@ -245,7 +271,11 @@ export function aggregate(
   // ~warn (worse). 50/50 on when the 2B vs 8B is right when they
   // disagree. Default behaviour preserves the conservative contract that
   // any critic at fail severity flips consensus to fail.
-  const weightedVoteOn = process.env.AGGREGATOR_WEIGHTED_VOTE === "1";
+  // 2026-05-12 (E9): was `process.env.AGGREGATOR_WEIGHTED_VOTE === "1"`
+  // read directly here, bypassing the "all knobs in config.ts" contract.
+  // Now imported from config.ts where the [ADAPT] documentation lives
+  // alongside the rest of the verdict-shaping constants.
+  const weightedVoteOn = AGGREGATOR_WEIGHTED_VOTE;
   const criticWeight = (c: CriticResult): number => c.weight ?? 1;
   const maxFailWeight = available
     .filter((c) => c.severity >= FAIL_SEVERITY_THRESHOLD)
@@ -264,17 +294,20 @@ export function aggregate(
   const divergence = consistency?.ran ? consistency.divergence_score : 0;
   const hasConsistencyContradiction =
     consistency?.ran && consistency.contradicted.length > 0;
-  const lowConfSpans = perplexity?.ran
-    ? perplexity.low_confidence_spans.length
-    : 0;
+  // NOTE: perplexity / model-uncertainty deliberately does NOT contribute to
+  // the consensus (2026-05-22). It is rendered as an advisory nudge only. See
+  // the header comment for why; the consistency check is the spine instead.
 
   // 2026-04-18: tightened the NLI-unsupported rule. Previously, any single
   // NLI "unsupported" claim would escalate consensus to warn. On the 48-case
   // NLI corpus this produced 8/8 false positives on `ctx-entailed` cases
   // (answers entailed by prior_context but flagged "neutral" by DeBERTa,
   // which the aggregator treats as unsupported). New rule: a single
-  // unsupported is noise; 2+ escalates; 1+ only escalates when critics also
-  // raised something (maxSeverity >= 1).
+  // unsupported is noise; 2+ escalates; 1+ only escalates when critics
+  // also raised something at WARN severity or higher (i.e.
+  // maxSeverity >= WARN_SEVERITY_THRESHOLD, currently 2). The comment
+  // here used to say "maxSeverity >= 1" which contradicted the code;
+  // corrected 2026-05-12.
   const unsupportedEscalates =
     unsupportedCount >= 2 ||
     (unsupportedCount >= 1 && maxSeverity >= WARN_SEVERITY_THRESHOLD);
@@ -289,7 +322,7 @@ export function aggregate(
     criticSeverityForcesFailure ||
     contradictionCount > 0 ||
     divergence >= CONSISTENCY_FAIL_THRESHOLD ||
-    recomputeMismatches > 0
+    (recompute?.mismatches?.length ?? 0) > 0
   ) {
     consensus = "fail";
   } else if (
@@ -297,8 +330,7 @@ export function aggregate(
     maxSeverity >= WARN_SEVERITY_THRESHOLD ||
     unsupportedEscalates ||
     hasConsistencyContradiction ||
-    divergence >= CONSISTENCY_WARN_THRESHOLD ||
-    lowConfSpans > 0
+    divergence >= CONSISTENCY_WARN_THRESHOLD
   ) {
     consensus = "warn";
   } else {
@@ -417,24 +449,17 @@ function buildSummary(params: {
 // the wall-of-JSON hard to scan at a glance, and were confused by legacy
 // wire IDs ("phi4_reasoning" / "nemotron_mini") that didn't match the
 // actual running models. 2026-05-11: those legacy IDs were renamed to
-// "granite_3_2_8b" / "granite_3_2_2b" so the wire id now matches the
-// model. We still render a human-friendly markdown block that uses
-// `display_name` ("IBM Granite 3.2 8B") for the critic column. The raw
-// JSON payload is preserved inside a collapsed <details> block so
-// developers can still see everything.
+// "granite_3_2_8b" / "granite_3_2_2b" so the wire id matched the model
+// then in play. 2026-05-20: the wire ids were generalised again to
+// "critic_a" / "critic_b" so future model swaps don't drag the wire id
+// with them. We still render a human-friendly markdown block that uses
+// `display_name` (the model's human-readable label) for the critic
+// column. The raw JSON payload is preserved inside a collapsed <details>
+// block so developers can still see everything.
 
 /** Short emoji verdict chip for the header line. */
 function verdictEmoji(v: Verdict): string {
-  switch (v) {
-    case "pass":
-      return "✅ pass";
-    case "warn":
-      return "⚠️ warn";
-    case "fail":
-      return "❌ fail";
-    case "error":
-      return "⛔ error";
-  }
+  return VERDICT_CHIPS[v];
 }
 
 /**
@@ -470,7 +495,7 @@ function criticLabel(c: CriticResult): string {
 function topConcernCell(c: CriticResult): string {
   const first = c.concerns[0];
   if (!first) return "—";
-  return `"${truncateCell(escapeMarkdownCell(first), 120)}"`;
+  return `"${truncateCell(escapeMarkdownCell(first), RENDER_CELL_TOPIC_CHARS)}"`;
 }
 
 /**
@@ -513,7 +538,7 @@ function renderDisputesSubTable(
   rows.push(`| --- | --- | --- | --- |`);
   const cellFor = (side: { verdict: string; severity: number; concern?: string }) => {
     if (side.concern !== undefined) {
-      return `${side.verdict} (${side.severity}/5) -- "${truncateCell(escapeMarkdownCell(side.concern), 120)}"`;
+      return `${side.verdict} (${side.severity}/5) -- "${truncateCell(escapeMarkdownCell(side.concern), RENDER_CELL_TOPIC_CHARS)}"`;
     }
     // The critic didn't raise this specific concern. Show their headline
     // verdict + severity so users see what they DID say, not just a bare
@@ -558,15 +583,7 @@ function renderDisputesSubTable(
 function checkChip(
   state: "pass" | "warn" | "fail" | "skipped" | "error" | "n_a" | "unable"
 ): string {
-  switch (state) {
-    case "pass":    return "✅ pass";
-    case "warn":    return "⚠️ warn";
-    case "fail":    return "❌ fail";
-    case "skipped": return "— skipped";
-    case "error":   return "⛔ unavailable";
-    case "n_a":     return "— N/A";
-    case "unable":  return "❓ unable to assess";
-  }
+  return CHECK_CHIPS[state];
 }
 
 export function renderSummaryMarkdown(
@@ -592,19 +609,17 @@ export function renderSummaryMarkdown(
   parts.push("_Paste this block into your reply (LM Studio collapses tool results)._");
   parts.push("");
 
-  // 0b. Echo the answer that was verified.
-  //
-  // 2026-05-11 v4: the worker (Qwen 3.5 9B) was passing a composed
-  // answer to verify_answer's `answer` parameter, but never
-  // emitting that prose as a visible assistant message — so the user
-  // saw a stack of tool-call accordions (search/fetch/verify) followed
-  // by the Verity testing block, with no visible answer. Echoing the
-  // answer at the top of the rendered block puts the prose into the
-  // chat regardless of whether the worker wrote a visible message
-  // body, because Qwen pastes the entire block verbatim per the
-  // directive above. The label tells the user "this is the answer
-  // that Verity assessed" so they understand the structure.
-  if (context.answer && context.answer.trim().length > 0) {
+  // 0b. Optionally echo the verified answer. Default OFF
+  // (SUMMARY_ECHO_ANSWER). The concise /verify style restates only the
+  // critics table and the bold conclusion; the worker shows its own answer
+  // per the FLOW / system prompt. Set VERITY_SUMMARY_ECHO_ANSWER=1 to restate
+  // the answer inside the block (the 2026-05-11 v4 behaviour), for a worker
+  // that calls verify_answer without first emitting a visible answer.
+  if (
+    SUMMARY_ECHO_ANSWER &&
+    context.answer &&
+    context.answer.trim().length > 0
+  ) {
     parts.push("## Answer");
     parts.push("");
     parts.push(context.answer.trim());
@@ -649,7 +664,7 @@ export function renderSummaryMarkdown(
         ? checkChip(state)
         : `${checkChip(state)} (${c.severity}/5)`;
     const detail = c.concerns[0]
-      ? `"${truncateCell(escapeMarkdownCell(c.concerns[0]), 140)}"`
+      ? `"${truncateCell(escapeMarkdownCell(c.concerns[0]), RENDER_CELL_CONCERN_CHARS)}"`
       : "no concern raised";
     testingRows.push(`| **${model}** (critic) | ${sevLabel} | ${detail} |`);
   });
@@ -702,45 +717,52 @@ export function renderSummaryMarkdown(
   // enabled but failed to run (worker doesn't support logprobs etc).
   const pipelineMode = output.meta?.mode ?? "standard";
 
+  // Helper: build the "why a deep-mode signal didn't run" string.
+  // Same three-branch decision for consistency and perplexity, with
+  // signal-specific final fallback wording.
+  const deepSkippedReason = (
+    signal: { notes?: string } | undefined,
+    defaultReason: string
+  ): string => {
+    if (pipelineMode === "standard") return "not enabled in standard mode";
+    if (signal && signal.notes) return escapeMarkdownCell(signal.notes);
+    return defaultReason;
+  };
+
   // 2d. Consistency (deep modes only).
+  // 2026-05-12 (E8): use the imported CONSISTENCY_*_THRESHOLD constants
+  // instead of the hardcoded 0.5 / 0.15 literals so a user who tunes
+  // the config knob sees the chip colour match the actual verdict.
   const consistency = output.consistency_check;
   if (consistency?.ran) {
     const div = consistency.divergence_score;
     let state: "pass" | "warn" | "fail";
-    if (div >= 0.5) state = "fail";
-    else if (div >= 0.15) state = "warn";
+    if (div >= CONSISTENCY_FAIL_THRESHOLD) state = "fail";
+    else if (div >= CONSISTENCY_WARN_THRESHOLD) state = "warn";
     else state = "pass";
     const detail = `divergence ${div}, ${consistency.contradicted.length} contradicted, ${consistency.unsupported.length} unsupported across ${consistency.samples_generated} re-sample(s)`;
     testingRows.push(`| **Consistency** (deep mode) | ${checkChip(state)} | ${detail} |`);
   } else {
-    let reason: string;
-    if (pipelineMode === "standard") {
-      reason = "not enabled in standard mode";
-    } else if (consistency && consistency.notes) {
-      reason = escapeMarkdownCell(consistency.notes);
-    } else {
-      reason = "did not run";
-    }
+    const reason = deepSkippedReason(consistency, "did not run");
     testingRows.push(`| **Consistency** (deep mode) | ${checkChip("skipped")} | ${reason} |`);
   }
 
-  // 2e. Perplexity (deep modes only).
+  // 2e. Perplexity / model uncertainty (deep modes only). ADVISORY: this row
+  //     is a nudge and does NOT change the consensus (2026-05-22) -- logprob
+  //     uncertainty misses fluent hallucinations and fires on rare-but-correct
+  //     wording, so it informs rather than votes.
   const perplexity = output.perplexity;
   if (perplexity?.ran) {
     const n = perplexity.low_confidence_spans.length;
     const state = n > 0 ? "warn" : "pass";
-    const detail = `perplexity ${perplexity.perplexity}, ${n} low-confidence span(s) flagged`;
-    testingRows.push(`| **Perplexity** (deep mode) | ${checkChip(state)} | ${detail} |`);
+    const detail = `perplexity ${perplexity.perplexity}, ${n} low-confidence span(s); advisory only, does not change the verdict`;
+    testingRows.push(`| **Perplexity** (deep mode, advisory) | ${checkChip(state)} | ${detail} |`);
   } else {
-    let reason: string;
-    if (pipelineMode === "standard") {
-      reason = "not enabled in standard mode";
-    } else if (perplexity && perplexity.notes) {
-      reason = escapeMarkdownCell(perplexity.notes);
-    } else {
-      reason = "did not run (worker may not support logprobs)";
-    }
-    testingRows.push(`| **Perplexity** (deep mode) | ${checkChip("skipped")} | ${reason} |`);
+    const reason = deepSkippedReason(
+      perplexity,
+      "did not run (worker may not support logprobs)"
+    );
+    testingRows.push(`| **Perplexity** (deep mode, advisory) | ${checkChip("skipped")} | ${reason} |`);
   }
 
   parts.push(testingRows.join("\n"));
@@ -781,26 +803,35 @@ export function renderSummaryMarkdown(
         ? "unable to assess"
         : `${c.verdict} (severity ${c.severity}/5)`;
     findings.push(
-      `- **${criticLabel(c)}** — ${label}: "${findingText(c.concerns[0], 800)}"`
+      `- **${criticLabel(c)}** — ${label}: "${findingText(c.concerns[0], RENDER_FINDING_CONCERN_CHARS)}"`
     );
     for (const extra of c.concerns.slice(1, 4)) {
       findings.push(
-        `    - also: "${findingText(extra, 600)}"`
+        `    - also: "${findingText(extra, RENDER_FINDING_EXTRA_CHARS)}"`
       );
     }
     if (c.suggested_fixes && c.suggested_fixes[0]) {
       findings.push(
-        `    - _suggested fix:_ "${findingText(c.suggested_fixes[0], 600)}"`
+        `    - _suggested fix:_ "${findingText(c.suggested_fixes[0], RENDER_FINDING_EXTRA_CHARS)}"`
       );
     }
   });
 
   // Recompute mismatches.
+  // 2026-05-12 (E7): strip backticks from expr_text before wrapping
+  // in inline-code backticks. A `expr_text` containing a literal
+  // backtick (rare but possible if the critic's regex picks up a
+  // markdown-formatted expression) would close the inline-code span
+  // prematurely and leak escape characters into the rest of the
+  // bullet. Same defence the consult.ts table renderers use.
   if (rc?.ran && rc.mismatches.length > 0) {
     for (const m of rc.mismatches.slice(0, 5)) {
-      const exprText = (m as { expr_text?: string }).expr_text ?? "";
+      const exprText = ((m as { expr_text?: string }).expr_text ?? "").replace(
+        /`/g,
+        ""
+      );
       findings.push(
-        `- **Recompute** found arithmetic mismatch: \`${findingText(exprText, 400)}\``
+        `- **Recompute** found arithmetic mismatch: \`${findingText(exprText, RENDER_FINDING_RECOMPUTE_CHARS)}\``
       );
     }
   }
@@ -813,13 +844,13 @@ export function renderSummaryMarkdown(
     for (const c of nli.contradictions.slice(0, 5)) {
       const claim = (c as { claim?: string }).claim ?? "";
       findings.push(
-        `- **NLI** found a claim CONTRADICTED by prior context: "${findingText(claim, 1000)}"`
+        `- **NLI** found a claim CONTRADICTED by prior context: "${findingText(claim, RENDER_FINDING_NLI_CLAIM_CHARS)}"`
       );
     }
     for (const u of nli.unsupported.slice(0, 3)) {
       const claim = (u as { claim?: string }).claim ?? "";
       findings.push(
-        `- **NLI** found a claim unsupported by prior context: "${findingText(claim, 1000)}"`
+        `- **NLI** found a claim unsupported by prior context: "${findingText(claim, RENDER_FINDING_NLI_CLAIM_CHARS)}"`
       );
     }
   }

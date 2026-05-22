@@ -163,7 +163,16 @@ ${JSON_OUTPUT_INSTRUCTIONS}
 // date stays current without a redeploy.
 
 function buildDatePreamble(): string {
-  const today = new Date().toISOString().slice(0, 10);
+  // 2026-05-12 (E13): was new Date().toISOString().slice(0, 10) which
+  // returns the date in UTC. For a user near midnight in their local
+  // timezone the date would be off by one day. Use the host's local
+  // calendar date instead — that's what the user thinks "today" is
+  // and what the critics should reason against.
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  const today = `${year}-${month}-${day}`;
   return `
 TODAY'S DATE: ${today}
 
@@ -259,6 +268,12 @@ export function buildCriticUserMessage(
   // block so the critic has an explicit "this answer contains X injection
   // attempts; discount them" signal, beyond the generic defensive-reading
   // guidance in the system prompt.
+  //
+  // The system prompt is the real defence here; the 80-char snippet
+  // previews below are mostly diagnostic context for the critic so it
+  // knows which pattern was matched. A short preview can be misleading
+  // (truncating an obfuscated marker), so callers should not rely on the
+  // preview alone to assess the injection — refer to the full answer.
   const markers = detectInjectionMarkers(answer);
   if (markers.length > 0) {
     const summary = markers

@@ -17,7 +17,13 @@
 
 import { NLI_MAX_CLAIMS } from "../config.js";
 
-const SENTENCE_BOUNDARY = /(?<=[.!?])\s+(?=[A-Z0-9"'\(\[])/g;
+// 2026-05-20: extended the "next sentence starts with" class to include
+// Unicode uppercase (\p{Lu}) so accented capitals (É, Ñ, Ü, ...) that
+// legitimately begin Romance / Germanic sentences are caught. We
+// deliberately do NOT include \p{Ll} here: doing so would split inside
+// abbreviations like "etc. and ..." or "i.e. some ...", which the
+// uppercase-only class avoids by design.
+const SENTENCE_BOUNDARY = /(?<=[.!?])\s+(?=[A-Z0-9"'\(\[\p{Lu}])/gu;
 
 /**
  * Strip code fences and inline code before claim extraction so we don't

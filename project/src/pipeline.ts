@@ -55,7 +55,19 @@ async function extractClaimsForMode(
   mode: VerifyMode
 ): Promise<string[]> {
   if (mode === "standard") return extractClaims(answer);
-  const llmClaims = await extractClaimsLLM(answer);
+  // 2026-05-12: extractClaimsLLM documents that it returns null on any
+  // failure, but a hard throw (network reset, aborted client, JSON
+  // structural panic) would bubble up and reject this function. The
+  // outer pipeline catches it, but the regex fallback never runs.
+  // Wrap defensively so the documented contract is genuinely honoured.
+  let llmClaims: string[] | null = null;
+  try {
+    llmClaims = await extractClaimsLLM(answer);
+  } catch (err) {
+    if (VERBOSE_LOGGING) {
+      console.error("[pipeline] extractClaimsLLM threw; falling back to regex:", err);
+    }
+  }
   if (llmClaims && llmClaims.length > 0) return llmClaims;
   // LLM extractor returned null (error) or empty → fall back to regex so
   // we still get *something* for NLI / consistency to work with.
@@ -133,22 +145,21 @@ export async function runVerificationPipeline(
      priorContextForCritics
    );
 
-   // Add small delay before starting critics to allow for clean transitions
-   // This helps prevent "already exists" conflicts when models are being swapped
-   await new Promise(resolve => setTimeout(resolve, 100));
-
-   // ── Critics (run sequentially with delays to prevent model conflicts) ─────
-   //
-   // Running critics sequentially with small delays helps prevent "already exists"
-   // conflicts and ensures clean model transitions in Ollama.
-   const criticPromises: Promise<CriticResult>[] = [];
-   for (const cfg of ALL_CRITICS) {
-     // Add delay before each critic call (except the first) to allow for clean transitions
-     if (criticPromises.length > 0) {
-       await new Promise(resolve => setTimeout(resolve, 500));
-     }
-     criticPromises.push(callCritic(cfg, { systemPrompt, userMessage }));
-   }
+   // ── Critics (fire in parallel) ──────────────────────────────────────────
+  //
+  // 2026-05-12: removed a 500ms inter-iteration await + a 100ms pre-loop
+  // sleep that were originally added to dodge an Ollama "model already
+  // exists" race during cold-load. Both critics share a single Ollama
+  // process and a single GPU; Ollama serialises actual GPU work at the
+  // hardware level. Adding a 500ms gap in the orchestrator just delayed
+  // dispatch without helping concurrency. Net wall-clock saving per
+  // /verify call: ~500ms with two critics, scaling linearly if the panel
+  // grows. The cold-load conflict it was guarding against was specific
+  // to JIT-loading; OLLAMA_MAX_LOADED_MODELS=2 keeps both critics warm
+  // (see start-verity.ps1).
+  const criticPromises: Promise<CriticResult>[] = ALL_CRITICS.map((cfg) =>
+    callCritic(cfg, { systemPrompt, userMessage })
+  );
 
   // ── Claim extraction (fires in parallel with critics) ────────────────
   //
@@ -266,83 +277,98 @@ export async function runVerificationPipeline(
   // ceiling, any still-running promise is left to settle in the background
   // (its timer will abort it eventually) and we surface a synthetic
   // "unavailable" result.
-  const resultsPromise = Promise.all([
-    Promise.all(criticPromises),
-    nliPromise,
-    consistencyPromise,
-    perplexityPromise,
-    recomputePromise,
-  ]);
-
-  let timedOut = false;
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<"__pipeline_timeout__">((resolve) => {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      resolve("__pipeline_timeout__");
-    }, PIPELINE_TIMEOUT_MS);
-    // Don't keep the event loop alive solely on this timer — if the
-    // server is shutting down, the pending request times out cleanly.
-    timeoutHandle.unref?.();
-  });
-
-  let raced: Awaited<typeof resultsPromise> | "__pipeline_timeout__";
-  try {
-    raced = await Promise.race([resultsPromise, timeoutPromise]);
-  } finally {
-    // Clear the timer on the happy path so it doesn't fire 180 s later
-    // and resolve a promise nobody is awaiting. Memory cost is small but
-    // accumulates in long-lived servers handling many requests.
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  // 2026-05-12 (E6): each signal is now wrapped with its own
+  // timeout-with-fallback so the pipeline-wide ceiling preserves any
+  // signal that finished in time. Previously a single missed critic
+  // would trip the outer Promise.all and the synthesized "timed out"
+  // stubs would replace WHOLE the result set — discarding every
+  // critic / NLI / recompute that did finish.
+  //
+  // Each wrapped promise resolves to its fulfilled value if the
+  // underlying call beat the timeout; otherwise it resolves to a
+  // domain-appropriate "skipped" stub. Promise.all on the wrapped
+  // set therefore never rejects and never throws away partial work.
+  function withTimeoutFallback<T>(
+    p: Promise<T>,
+    ms: number,
+    fallback: () => T
+  ): Promise<T> {
+    return new Promise<T>((resolve) => {
+      const timer = setTimeout(() => resolve(fallback()), ms);
+      timer.unref?.();
+      p.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        () => {
+          // Underlying call rejected (shouldn't, because every leg has
+          // its own .catch returning a structured stub, but defensive).
+          clearTimeout(timer);
+          resolve(fallback());
+        }
+      );
+    });
   }
 
   const [criticResults, nliResult, consistencyResult, perplexityResult, recomputeResult] =
-    timedOut || raced === "__pipeline_timeout__"
-      ? [
-          // Synthesise one "timed out" critic result per configured critic
-          // so aggregation reports them as unavailable rather than silently
-          // passing. Derived from ALL_CRITICS so renames propagate.
-          ALL_CRITICS.map((c) =>
-            makeTimedOutCritic(c.id, c.displayName, c.family)
-          ),
-          {
-            ran: false,
-            claims_checked: 0,
-            contradictions: [],
-            unsupported: [],
-            notes: `NLI skipped: pipeline timeout after ${PIPELINE_TIMEOUT_MS}ms.`,
-          } satisfies NliResult,
-          undefined,
-          undefined,
-          {
-            ran: false,
-            expressions_found: 0,
-            verifications: [],
-            mismatches: [],
-            notes: `Recompute skipped: pipeline timeout.`,
-            latency_ms: 0,
-          } satisfies RecomputeResult,
-        ] as [CriticResult[], NliResult, ConsistencyResult | undefined, PerplexityResult | undefined, RecomputeResult]
-      : (raced as [CriticResult[], NliResult, ConsistencyResult | undefined, PerplexityResult | undefined, RecomputeResult]);
+    await Promise.all([
+      Promise.all(
+        criticPromises.map((p, i) =>
+          withTimeoutFallback<CriticResult>(p, PIPELINE_TIMEOUT_MS, () =>
+            makeTimedOutCritic(
+              ALL_CRITICS[i].id,
+              ALL_CRITICS[i].displayName,
+              ALL_CRITICS[i].family
+            )
+          )
+        )
+      ),
+      withTimeoutFallback<NliResult>(nliPromise, PIPELINE_TIMEOUT_MS, () => ({
+        ran: false,
+        claims_checked: 0,
+        contradictions: [],
+        unsupported: [],
+        notes: `NLI skipped: pipeline timeout after ${PIPELINE_TIMEOUT_MS}ms.`,
+      })),
+      withTimeoutFallback<ConsistencyResult | undefined>(
+        consistencyPromise,
+        PIPELINE_TIMEOUT_MS,
+        () => undefined
+      ),
+      withTimeoutFallback<PerplexityResult | undefined>(
+        perplexityPromise,
+        PIPELINE_TIMEOUT_MS,
+        () => undefined
+      ),
+      withTimeoutFallback<RecomputeResult>(
+        recomputePromise,
+        PIPELINE_TIMEOUT_MS,
+        () => ({
+          ran: false,
+          expressions_found: 0,
+          verifications: [],
+          mismatches: [],
+          notes: `Recompute skipped: pipeline timeout.`,
+          latency_ms: 0,
+        })
+      ),
+    ]);
 
-  // Look up critics by id so a reordering of ALL_CRITICS in
-  // critic-configs.ts doesn't silently mis-populate the output keys.
-  const findCritic = (id: string): CriticResult => {
-    const hit = criticResults.find((c) => c.id === id);
-    if (hit) return hit;
-    // Should be unreachable — criticResults is sized from ALL_CRITICS —
-    // but returning a well-formed unavailable result is safer than throwing
-    // inside the final assembly.
-    return makeTimedOutCritic(id, id, "Unknown");
-  };
+  // 2026-05-12 (E14): keyed by id, derived from ALL_CRITICS. Adding
+  // or renaming a critic is now a one-file change in critic-configs.ts;
+  // the output schema follows automatically. Previously this block
+  // had each critic id literally listed and types.ts mirrored them.
+  const critics: Record<string, CriticResult> = {};
+  for (const cfg of ALL_CRITICS) {
+    const hit = criticResults.find((c) => c.id === cfg.id);
+    critics[cfg.id] = hit ?? makeTimedOutCritic(cfg.id, cfg.displayName, cfg.family);
+  }
 
-  const critics = {
-    granite_3_2_8b: findCritic("granite_3_2_8b"),
-    granite_3_2_2b: findCritic("granite_3_2_2b"),
-    // llama32_3b removed with 2-critic redesign; re-add here if CRITIC_C
-    // is re-enabled in critic-configs.ts
-  };
-  const granite8b = critics.granite_3_2_8b;
+  // Strong critic for the meta.*_input_truncated flag (defaults to
+  // the first critic in ALL_CRITICS — currently CRITIC_A / Granite 8B).
+  const strongCriticId = ALL_CRITICS[0]?.id;
+  const strongCritic = strongCriticId ? critics[strongCriticId] : undefined;
 
   const aggregated = aggregate(criticResults, nliResult, {
     consistency: consistencyResult,
@@ -377,7 +403,9 @@ export async function runVerificationPipeline(
       mode,
       task_type: resolved_task_type,
       context_mode: contextMode,
-      granite_8b_input_truncated: granite8b.notes.some((n) => n.includes("truncated")),
+      granite_8b_input_truncated: !!strongCritic?.notes.some((n) =>
+        n.includes("truncated")
+      ),
       critics_unavailable: aggregated.critics_unavailable,
     },
   };

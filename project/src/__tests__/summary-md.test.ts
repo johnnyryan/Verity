@@ -16,6 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { renderSummaryMarkdown } from "../aggregator.js";
+import { CHECK_CHIPS, VERDICT_CHIPS } from "../render-constants.js";
 import type {
   CriticResult,
   NliResult,
@@ -25,7 +26,7 @@ import type {
 
 function critic(overrides: Partial<CriticResult> = {}): CriticResult {
   return {
-    id: overrides.id ?? "granite_3_2_8b",
+    id: overrides.id ?? "critic_a",
     display_name: overrides.display_name ?? "IBM Granite 3.2 8B",
     family: overrides.family ?? "IBM",
     verdict: overrides.verdict ?? "pass",
@@ -57,12 +58,12 @@ const cleanRecompute: RecomputeResult = {
 };
 
 function baseOutput(overrides: Partial<VerifyOutput> = {}): VerifyOutput {
-  const a = critic({ id: "granite_3_2_8b", display_name: "IBM Granite 3.2 8B" });
-  const b = critic({ id: "granite_3_2_2b", display_name: "IBM Granite 3.2 2B" });
+  const a = critic({ id: "critic_a", display_name: "IBM Granite 3.2 8B" });
+  const b = critic({ id: "critic_b", display_name: "IBM Granite 3.2 2B" });
   return {
     critics: {
-      granite_3_2_8b: a,
-      granite_3_2_2b: b,
+      critic_a: a,
+      critic_b: b,
     },
     disputes: [],
     nli_check: cleanNli,
@@ -104,30 +105,22 @@ test("table heading comes immediately after the paste marker when no answer cont
   assert.equal(lines[2], "### Verity testing");
 });
 
-test("answer is echoed at the top of the block when passed via context (2026-05-11 v4)", () => {
-  // The worker (Qwen 3.5 9B) was passing a composed answer to the
-  // tool's `answer` parameter but never emitting that prose as a
-  // visible assistant message. Echoing the answer in the rendered
-  // block puts the prose into the user's view regardless.
+test("answer is NOT echoed by default; block is table + conclusion only (2026-05-22)", () => {
+  // SUMMARY_ECHO_ANSWER defaults off: the worker shows its own answer (per
+  // the FLOW / system prompt), so the /verify block restates only the
+  // critics table and the bold conclusion, never the answer text.
   const md = renderSummaryMarkdown(baseOutput(), {
     answer:
       "LLMs do hallucinate, with rates varying from 3% to 27% in academic " +
       "benchmarks depending on model and domain.",
   });
   assert.ok(
-    md.includes("## Answer"),
-    "expected '## Answer' heading when answer context is passed"
+    !md.includes("## Answer"),
+    "answer heading must not appear by default"
   );
   assert.ok(
-    md.includes("LLMs do hallucinate, with rates varying"),
-    "expected the literal answer text in the rendered block"
-  );
-  // The answer should appear BEFORE the Verity testing table.
-  const answerIdx = md.indexOf("## Answer");
-  const tableIdx = md.indexOf("### Verity testing");
-  assert.ok(
-    answerIdx > 0 && tableIdx > answerIdx,
-    "answer echo must come before the Verity testing table"
+    !md.includes("LLMs do hallucinate, with rates varying"),
+    "answer text must not appear in the block by default"
   );
 });
 
@@ -166,21 +159,21 @@ test("pass consensus renders the green-tick emoji in the bold conclusion", () =>
   );
   // The verdict emoji now appears inside the bold conclusion at the bottom
   // (format: "**<emoji> <verdict> — <summary>**").
-  assert.ok(md.includes("✅ pass"), "expected ✅ pass chip");
+  assert.ok(md.includes(VERDICT_CHIPS.pass), `expected ${VERDICT_CHIPS.pass} chip`);
 });
 
 test("warn consensus renders the warn emoji in the bold conclusion", () => {
   const md = renderSummaryMarkdown(
     baseOutput({ consensus: "warn", summary: "One critic raised a concern." })
   );
-  assert.ok(md.includes("⚠️ warn"), "expected ⚠️ warn chip");
+  assert.ok(md.includes(VERDICT_CHIPS.warn), `expected ${VERDICT_CHIPS.warn} chip`);
 });
 
 test("fail consensus renders the red-cross emoji in the bold conclusion", () => {
   const md = renderSummaryMarkdown(
     baseOutput({ consensus: "fail", summary: "Critics flagged contradictions." })
   );
-  assert.ok(md.includes("❌ fail"), "expected ❌ fail chip");
+  assert.ok(md.includes(VERDICT_CHIPS.fail), `expected ${VERDICT_CHIPS.fail} chip`);
 });
 
 test("critic table lists display_name for each critic, not the wire id", () => {
@@ -198,12 +191,12 @@ test("critic table lists display_name for each critic, not the wire id", () => {
   // table row is keyed on display_name.
   const beforeDetails = md.split("<details>")[0];
   assert.ok(
-    !beforeDetails.includes("granite_3_2_8b"),
-    "wire id 'granite_3_2_8b' should NOT appear in the rendered table"
+    !beforeDetails.includes("critic_a"),
+    "wire id 'critic_a' should NOT appear in the rendered table"
   );
   assert.ok(
-    !beforeDetails.includes("granite_3_2_2b"),
-    "wire id 'granite_3_2_2b' should NOT appear in the rendered table"
+    !beforeDetails.includes("critic_b"),
+    "wire id 'critic_b' should NOT appear in the rendered table"
   );
 });
 
@@ -236,14 +229,14 @@ test("severity renders with /5 scale so it's not ambiguous", () => {
   const md = renderSummaryMarkdown(
     baseOutput({
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "warn",
           severity: 3,
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -317,8 +310,8 @@ test("Disputes count only appears in Findings when > 0", () => {
       disputes: [
         {
           kind: "verdict-mismatch",
-          critic_a_id: "granite_3_2_8b",
-          critic_b_id: "granite_3_2_2b",
+          critic_a_id: "critic_a",
+          critic_b_id: "critic_b",
           critic_a: { verdict: "pass", severity: 0 },
           critic_b: { verdict: "fail", severity: 4, concern: "bug detected" },
           severity: "hard",
@@ -339,8 +332,8 @@ test("no separate Disputes sub-table -- all critic info in one table", () => {
       disputes: [
         {
           kind: "verdict-mismatch",
-          critic_a_id: "granite_3_2_8b",
-          critic_b_id: "granite_3_2_2b",
+          critic_a_id: "critic_a",
+          critic_b_id: "critic_b",
           critic_a: { verdict: "pass", severity: 0 },
           critic_b: { verdict: "fail", severity: 4, concern: "bug detected" },
           severity: "hard",
@@ -363,16 +356,16 @@ test("Findings section lists each critic's concerns when verdict is fail", () =>
   const md = renderSummaryMarkdown(
     baseOutput({
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "fail",
           severity: 4,
           concerns: ["The arithmetic in step 3 is wrong: 2+2=5 is false."],
           suggested_fixes: ["Correct step 3 to 2+2=4."],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
           verdict: "warn",
           severity: 2,
@@ -482,15 +475,15 @@ test("three-way follow-up (redraft / /verifydeeper / no) appears on findings in 
     baseOutput({
       consensus: "fail",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "fail",
           severity: 4,
           concerns: ["arithmetic mistake"],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -519,15 +512,15 @@ test("three-way follow-up also appears on warn consensus with findings", () => {
     baseOutput({
       consensus: "warn",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "warn",
           severity: 2,
           concerns: ["hedging language"],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -551,15 +544,15 @@ test("in deeper mode, follow-up is just the redraft prompt (/verifydeeper alread
         critics_unavailable: [],
       },
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "warn",
           severity: 2,
           concerns: ["hedging language"],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -594,27 +587,27 @@ test("critic with verdict=pass but concerns raised renders '❓ unable to assess
     baseOutput({
       consensus: "pass",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "pass",
           severity: 0,
           concerns: ["The sources provided are not detailed enough for verification."],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
     })
   );
   assert.ok(
-    md.includes("❓ unable to assess"),
-    "expected '❓ unable to assess' chip when verdict=pass + concerns raised"
+    md.includes(CHECK_CHIPS.unable),
+    `expected '${CHECK_CHIPS.unable}' chip when verdict=pass + concerns raised`
   );
   assert.ok(
-    !md.match(/\| \*\*IBM Granite 3\.2 8B\*\* \(critic\) \| ✅ pass/),
-    "Granite 8B row must NOT show ✅ pass when it raised a concern"
+    !md.includes(`| **IBM Granite 3.2 8B** (critic) | ${CHECK_CHIPS.pass}`),
+    `Granite 8B row must NOT show ${CHECK_CHIPS.pass} when it raised a concern`
   );
 });
 
@@ -625,27 +618,27 @@ test("critic with verdict=pass and NO concerns still renders '✅ pass'", () => 
     baseOutput({
       consensus: "pass",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "pass",
           severity: 0,
           concerns: [],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
     })
   );
   assert.ok(
-    md.match(/\| \*\*IBM Granite 3\.2 8B\*\* \(critic\) \| ✅ pass/),
-    "clean-pass critic with no concerns must still show ✅ pass"
+    md.includes(`| **IBM Granite 3.2 8B** (critic) | ${CHECK_CHIPS.pass}`),
+    `clean-pass critic with no concerns must still show ${CHECK_CHIPS.pass}`
   );
   assert.ok(
-    !md.includes("❓ unable to assess"),
-    "no '❓ unable to assess' chip when concerns is empty"
+    !md.includes(CHECK_CHIPS.unable),
+    `no '${CHECK_CHIPS.unable}' chip when concerns is empty`
   );
 });
 
@@ -663,8 +656,8 @@ test("recompute row shows '— N/A' when answer has no arithmetic to verify", ()
     })
   );
   assert.ok(
-    md.includes("— N/A"),
-    "expected '— N/A' chip for recompute when verifications is empty"
+    md.includes(CHECK_CHIPS.n_a),
+    `expected '${CHECK_CHIPS.n_a}' chip for recompute when verifications is empty`
   );
   assert.ok(
     md.includes("no arithmetic in the answer to verify"),
@@ -682,15 +675,15 @@ test("Findings bullet for verdict=pass + concerns says 'unable to assess' not 'p
     baseOutput({
       consensus: "pass",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           verdict: "pass",
           severity: 0,
           concerns: ["Sources are not detailed enough."],
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -727,15 +720,15 @@ test("redraft prompt is SUPPRESSED on 'error' consensus (unreliable verdict)", (
     baseOutput({
       consensus: "error",
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           unavailable: true,
           error: "timeout",
           verdict: "error",
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
           unavailable: true,
           error: "timeout",
@@ -756,15 +749,15 @@ test("pipes in concern text are escaped", () => {
   const md = renderSummaryMarkdown(
     baseOutput({
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           concerns: ["foo | bar | baz"],
           verdict: "warn",
           severity: 2,
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -782,15 +775,15 @@ test("unavailable critics render the error message and no numeric severity", () 
   const md = renderSummaryMarkdown(
     baseOutput({
       critics: {
-        granite_3_2_8b: critic({
-          id: "granite_3_2_8b",
+        critic_a: critic({
+          id: "critic_a",
           display_name: "IBM Granite 3.2 8B",
           unavailable: true,
           error: "timeout after 45s",
           verdict: "error",
         }),
-        granite_3_2_2b: critic({
-          id: "granite_3_2_2b",
+        critic_b: critic({
+          id: "critic_b",
           display_name: "IBM Granite 3.2 2B",
         }),
       },
@@ -800,5 +793,5 @@ test("unavailable critics render the error message and no numeric severity", () 
   // 2026-05-11 (afternoon): in the Verity testing table, an unavailable
   // critic row gets the "⛔ unavailable" outcome chip and the error
   // message in the Detail column (no numeric severity to display).
-  assert.ok(md.includes("⛔ unavailable"), "expected ⛔ unavailable chip in outcome cell");
+  assert.ok(md.includes(CHECK_CHIPS.error), `expected ${CHECK_CHIPS.error} chip in outcome cell`);
 });

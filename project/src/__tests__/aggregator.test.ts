@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { aggregate, computeDisputes } from "../aggregator.js";
+import { CONSISTENCY_FAIL_THRESHOLD } from "../config.js";
 import type {
   ConsistencyResult,
   CriticResult,
@@ -161,7 +162,7 @@ test("consistency divergence >= fail threshold → fail", () => {
       { claim: "y", contradicting_sample_index: 1, confidence: 0.9 },
     ],
     unsupported: [],
-    divergence_score: 0.5,
+    divergence_score: CONSISTENCY_FAIL_THRESHOLD,
     latency_ms: 500,
     notes: "",
   };
@@ -225,7 +226,11 @@ test("divergence at warn threshold → warn", () => {
   assert.equal(out.consensus, "warn");
 });
 
-test("perplexity low-confidence spans alone → warn", () => {
+test("perplexity low-confidence spans alone → pass (advisory, never flips the verdict)", () => {
+  // 2026-05-22: perplexity / model-uncertainty was demoted to an advisory
+  // nudge. Low-confidence spans no longer escalate the consensus; only the
+  // critics, NLI, recompute, and consistency do. Clean critics + a flagged
+  // perplexity must therefore still read "pass".
   const perplexity: PerplexityResult = {
     ran: true,
     method: "forward_pass_rescore",
@@ -245,7 +250,7 @@ test("perplexity low-confidence spans alone → warn", () => {
     cleanNli,
     { perplexity }
   );
-  assert.equal(out.consensus, "warn");
+  assert.equal(out.consensus, "pass");
 });
 
 test("fail beats warn when both present", () => {

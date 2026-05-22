@@ -57,6 +57,15 @@ import { findBalancedJsonObject } from "../critics/parse.js";
 import { getLlmClient } from "../llm/client.js";
 import { stripReasoningTraces } from "../sanitize.js";
 
+/**
+ * Maximum number of disputes surfaced by the analysis pass. Anything past
+ * this is dropped on the floor; the user already sees too much when there
+ * are five real disagreements between two answerers, and the table widget
+ * gets unwieldy beyond that. Exported so the test suite can assert against
+ * it without re-encoding the literal.
+ */
+export const MAX_ANALYSIS_DISPUTES = 5;
+
 const ANSWERER_SYSTEM_PROMPT = `
 You are an independent answerer providing a second opinion. A different model
 (the "primary") has been asked the same question. Your answer will be shown
@@ -284,7 +293,11 @@ const NEGATIVE_POLARITY = [
 function firstSentence(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return "";
-  const m = trimmed.match(/^[\s\S]*?[.?!](?=\s|$)/);
+  // Sentence-ending punctuation may be followed by a closing quote/paren
+  // ('.' '.' '.') as well as whitespace or end-of-text. Without the
+  // closing-bracket alternates a sentence like `He said "ok."` would not
+  // match and the whole text would be returned.
+  const m = trimmed.match(/^[\s\S]*?[.?!](?=\s|$|["')\]])/);
   return (m ? m[0] : trimmed).trim();
 }
 
@@ -364,12 +377,45 @@ export function computeDisputes(
 
 const endpointQueue = new Map<string, Promise<unknown>>();
 
+/**
+ * Maximum time we will wait to acquire the per-endpoint lock before
+ * giving up. If the prior holder leaked (e.g. AbortController failed to
+ * cancel the underlying HTTP socket), without this bound subsequent
+ * callers would queue behind a dead promise forever. Set generously:
+ * the slowest legitimate /second is bounded by
+ * SECOND_OPINION_*_TIMEOUT_MS, and the analysis pass adds a small
+ * follow-up. 5 minutes is comfortably above the worst legitimate
+ * wait and aggressively below "wedged".
+ */
+const ENDPOINT_LOCK_MAX_WAIT_MS = 5 * 60 * 1000;
+
 function withEndpointLock<T>(
   endpoint: string,
   fn: () => Promise<T>
 ): Promise<T> {
   const prior = endpointQueue.get(endpoint) ?? Promise.resolve();
-  const next = prior.catch(() => {}).then(fn);
+
+  // 2026-05-12 (D1): race lock acquisition against a bounded timeout
+  // so a leaked prior promise can't wedge subsequent calls forever.
+  // The timeout fires only when the prior holder genuinely hangs;
+  // legitimate callers see no difference.
+  const acquired = Promise.race([
+    prior.catch(() => {}),
+    new Promise<void>((_resolve, reject) =>
+      setTimeout(
+        () =>
+          reject(
+            new Error(
+              `withEndpointLock: timed out waiting ` +
+                `${ENDPOINT_LOCK_MAX_WAIT_MS} ms for ${endpoint}`
+            )
+          ),
+        ENDPOINT_LOCK_MAX_WAIT_MS
+      ).unref?.()
+    ),
+  ]);
+
+  const next = acquired.then(fn);
   endpointQueue.set(
     endpoint,
     next.catch(() => {})
@@ -471,9 +517,10 @@ function analysisUserPrompt(args: {
   amdAnswer: string;
   nvidiaAnswer: string;
   primaryModelName: string;
+  amdModelName: string;
   mode: ResolutionMode;
 }): string {
-  const { question, amdAnswer, nvidiaAnswer, primaryModelName, mode } = args;
+  const { question, amdAnswer, nvidiaAnswer, primaryModelName, amdModelName, mode } = args;
 
   const schemaLines = [
     "Schema:",
@@ -500,7 +547,7 @@ function analysisUserPrompt(args: {
     "",
     `Question: ${question.trim()}`,
     "",
-    "AMD answer (Granite 3.2 8B):",
+    `AMD answer (${amdModelName}):`,
     amdAnswer.trim(),
     "",
     `NVIDIA answer (${primaryModelName}):`,
@@ -527,24 +574,33 @@ function escapeHtml(value: string): string {
     .trim();
 }
 
+// 2026-05-12 (E12): renderDisputesTable / renderDisputesMarkdown
+// previously hardcoded "Granite 3.2 8B" as the AMD-side header even
+// though the AMD model is configurable via SECOND_OPINION_MODEL. Both
+// renderers now take an explicit `amdModelName` so the header always
+// matches whichever model actually answered.
 export function renderDisputesTable(
   disputes: AnalysisDispute[],
-  primaryModelName: string
+  primaryModelName: string,
+  amdModelName: string
 ): string {
   if (!Array.isArray(disputes) || disputes.length === 0) {
     return "<p><em>No disputes — models agreed.</em></p>";
   }
-  const th =
-    "padding:6px 10px;text-align:left;border:1px solid #888;";
-  const td =
-    "padding:6px 10px;border:1px solid #888;vertical-align:top;";
+  // Shared cell-styling building blocks. The `#c62828` red header is
+  // the only spec-bearing colour (matches the /verify red-fail chip);
+  // everything else is a neutral border + padding that any chat UI's
+  // default theme can override.
+  const cellBase = "padding:6px 10px;border:1px solid #888;";
+  const th = `${cellBase}text-align:left;`;
+  const td = `${cellBase}vertical-align:top;`;
   const tableStyle =
     "border-collapse:collapse;margin:0.5em 0;font-size:0.95em;border:1px solid #888;";
   const headerStyle = "background:#c62828;color:#fff;";
   const header =
     `<thead><tr style="${headerStyle}">` +
     `<th style="${th}">Topic</th>` +
-    `<th style="${th}">AMD (Granite 3.2 8B)</th>` +
+    `<th style="${th}">AMD (${escapeHtml(amdModelName)})</th>` +
     `<th style="${th}">NVIDIA (${escapeHtml(primaryModelName)})</th>` +
     `</tr></thead>`;
   const body =
@@ -576,7 +632,8 @@ export function renderDisputesTable(
  */
 export function renderDisputesMarkdown(
   disputes: AnalysisDispute[],
-  primaryModelName: string
+  primaryModelName: string,
+  amdModelName: string
 ): string {
   if (!Array.isArray(disputes) || disputes.length === 0) {
     return "_No disputes — models agreed._";
@@ -588,11 +645,20 @@ export function renderDisputesMarkdown(
       .replace(/\r?\n/g, "<br>")
       .trim();
   const rows: string[] = [];
-  rows.push(`| Topic | AMD (Granite 3.2 8B) | NVIDIA (${escapeCell(primaryModelName)}) |`);
+  rows.push(
+    `| Topic | AMD (${escapeCell(amdModelName)}) | NVIDIA (${escapeCell(primaryModelName)}) |`
+  );
   rows.push(`| --- | --- | --- |`);
   for (const d of disputes) {
+    const escapedTopic = escapeCell(d.topic);
+    // Skip the `**...**` bold wrapper when the topic contains a `*` —
+    // wrapping would either nest unevenly or close the bold mid-text,
+    // producing visibly mangled markdown. Edge case.
+    const topicCell = escapedTopic.includes("*")
+      ? escapedTopic
+      : `**${escapedTopic}**`;
     rows.push(
-      `| **${escapeCell(d.topic)}** | ${escapeCell(d.amd_position)} | ${escapeCell(d.nvidia_position)} |`
+      `| ${topicCell} | ${escapeCell(d.amd_position)} | ${escapeCell(d.nvidia_position)} |`
     );
   }
   return rows.join("\n");
@@ -613,37 +679,71 @@ export function renderDisputesMarkdown(
  * second pass. Same treatment for the plain-text `Thinking Process:`
  * preamble that some variants emit without tags.
  */
-export function extractAnalysisJson(raw: string): unknown | null {
-  if (!raw) return null;
+/**
+ * Result of attempting to extract the analysis JSON from a model
+ * response. Three failure modes are distinguished so the caller can
+ * report telemetry / surface the right error to the user:
+ *   - `empty`          — the input was empty after trimming. Usually
+ *                        means the model never emitted anything (worker
+ *                        cancelled, request aborted).
+ *   - `no_json_found`  — the model produced output but no balanced
+ *                        JSON object with an `agreements` key. The
+ *                        canonical "runaway reasoning trace consumed
+ *                        max_tokens without emitting JSON" failure mode.
+ *   - `parse_error`    — a candidate JSON span was found but JSON.parse
+ *                        rejected it (truncated mid-object, escape
+ *                        gore, etc.).
+ *
+ * 2026-05-12 (D2): was `unknown | null`. The collapsed return value
+ * conflated "model said nothing useful" with "JSON was malformed",
+ * which made the observed runaway-reasoning failure mode invisible.
+ */
+export type AnalysisJsonExtractResult =
+  | { ok: true; value: unknown }
+  | { ok: false; reason: "empty" | "no_json_found" | "parse_error" };
+
+export function extractAnalysisJsonDetailed(
+  raw: string
+): AnalysisJsonExtractResult {
+  if (!raw || !raw.trim()) return { ok: false, reason: "empty" };
   let s = stripReasoningTraces(raw).trim();
 
   // Second pass: drop any unclosed <think>/<thinking>/<reasoning> opener.
-  // Matches `<think>…` with NO closing tag; we strip from the opener to end.
-  // If a closing tag appears later in the string (rare but possible — model
-  // emits a second <think> that DOES close), stripReasoningTraces already
-  // handled the first paired block; this catches the unpaired tail.
   s = s.replace(/<(?:think|thinking|reasoning)>[\s\S]*$/i, "").trim();
 
-  // Plain-text preamble some models emit without tags ("Thinking Process:"
-  // followed by prose then the JSON object). The balanced-brace scanner
-  // below tolerates `{` inside the preamble, but a leading paragraph
-  // would still slow it down — strip it explicitly.
+  // Plain-text preamble some models emit without tags.
   s = s.replace(/^(?:thinking\s+process\s*:[\s\S]*?)(?=\{|$)/i, "").trim();
 
   // Strip ```json ... ``` or ``` ... ``` fences.
   s = s.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 
-  // Use the shared balanced-brace finder, preferring objects that contain
-  // an `agreements` key (the canonical top-level field for this schema).
-  // The previous indexOf/lastIndexOf span could grab the wrong text if the
-  // model emitted prose containing `{` characters before the JSON object.
+  if (!s) return { ok: false, reason: "empty" };
+
   const candidate = findBalancedJsonObject(s, { requireKey: "agreements" });
-  if (!candidate) return null;
+  if (!candidate) return { ok: false, reason: "no_json_found" };
   try {
-    return JSON.parse(candidate);
-  } catch {
-    return null;
+    return { ok: true, value: JSON.parse(candidate) };
+  } catch (err) {
+    if (VERBOSE_LOGGING) {
+      console.error(
+        "[extractAnalysisJsonDetailed] JSON.parse failed:",
+        err instanceof Error ? err.message : String(err),
+        "candidate prefix:",
+        candidate.slice(0, 200)
+      );
+    }
+    return { ok: false, reason: "parse_error" };
   }
+}
+
+/**
+ * Backwards-compatible thin wrapper. Returns the parsed value on
+ * success or null on any failure. Tests / callers that need the
+ * specific failure reason should use extractAnalysisJsonDetailed.
+ */
+export function extractAnalysisJson(raw: string): unknown | null {
+  const result = extractAnalysisJsonDetailed(raw);
+  return result.ok ? result.value : null;
 }
 
 function isAnalysisDispute(v: unknown): v is AnalysisDispute {
@@ -665,6 +765,10 @@ export async function runAnalysisPass(args: {
   amdAnswer: string;
   nvidiaAnswer: string;
   primaryModelName: string;
+  // 2026-05-12 (E12): label used for the AMD column in the rendered
+  // dispute table and in the prompt. Defaults to SECOND_OPINION_MODEL
+  // if absent so callers don't all need to thread it through.
+  amdModelName?: string;
   mode: ResolutionMode;
   endpoint?: string;
   apiKey?: string;
@@ -679,6 +783,7 @@ export async function runAnalysisPass(args: {
     primaryModelName,
     mode,
   } = args;
+  const amdModelName = args.amdModelName ?? SECOND_OPINION_MODEL;
   const endpoint = args.endpoint ?? SECOND_OPINION_PRIMARY_ENDPOINT;
   const apiKey = args.apiKey ?? SECOND_OPINION_PRIMARY_API_KEY;
   const model = args.model ?? SECOND_OPINION_ANALYSIS_MODEL;
@@ -712,6 +817,7 @@ export async function runAnalysisPass(args: {
               amdAnswer,
               nvidiaAnswer,
               primaryModelName,
+              amdModelName,
               mode,
             }),
           },
@@ -723,11 +829,29 @@ export async function runAnalysisPass(args: {
     );
 
     const raw = response.choices[0]?.message?.content ?? "";
-    const parsed = extractAnalysisJson(raw);
+    // 2026-05-12 (D2): distinguish the three analysis-extraction
+    // failure modes so the verdict surfaces the right error and
+    // we get useful telemetry instead of an opaque "parse failure".
+    const extracted = extractAnalysisJsonDetailed(raw);
+    if (!extracted.ok) {
+      const reasonMsg = {
+        empty: "analysis returned empty (model produced no output)",
+        no_json_found:
+          "analysis returned no valid JSON (likely runaway reasoning trace consumed max_tokens)",
+        parse_error:
+          "analysis JSON found but malformed (truncated or escape error)",
+      }[extracted.reason];
+      if (VERBOSE_LOGGING) {
+        console.error(
+          `[second-opinion:analysis:${model}@${endpoint}] extract failed: ` +
+            `${extracted.reason} (raw len=${raw.length})`
+        );
+      }
+      return { ...unavailable(reasonMsg) };
+    }
+    const parsed = extracted.value;
     if (!parsed || typeof parsed !== "object") {
-      return {
-        ...unavailable("analysis JSON parse failure"),
-      };
+      return { ...unavailable("analysis returned non-object JSON") };
     }
 
     const obj = parsed as Record<string, unknown>;
@@ -735,14 +859,14 @@ export async function runAnalysisPass(args: {
       ? obj.agreements.filter((x): x is string => typeof x === "string")
       : [];
     const disputesRaw = Array.isArray(obj.disputes) ? obj.disputes : [];
-    const disputes = disputesRaw.filter(isAnalysisDispute).slice(0, 5);
+    const disputes = disputesRaw.filter(isAnalysisDispute).slice(0, MAX_ANALYSIS_DISPUTES);
     const final_answer =
       mode === "auto" && typeof obj.final_answer === "string" && obj.final_answer.trim().length > 0
         ? obj.final_answer.trim()
         : undefined;
 
-    const table_html = renderDisputesTable(disputes, primaryModelName);
-    const table_md = renderDisputesMarkdown(disputes, primaryModelName);
+    const table_html = renderDisputesTable(disputes, primaryModelName, amdModelName);
+    const table_md = renderDisputesMarkdown(disputes, primaryModelName, amdModelName);
 
     if (VERBOSE_LOGGING) {
       console.error(
@@ -780,26 +904,34 @@ export async function runAnalysisPass(args: {
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────
 
-export async function runSecondOpinion(
-  input: ConsultInput
+/**
+ * Legacy single-Ollama path. Used when input.model is set OR
+ * SECOND_OPINION_DUAL_ENABLED is "0". Preserves pre-2026-04-20
+ * wire shape: no dual_opinion, no analysis, disputes: [].
+ */
+async function runLegacy(
+  input: ConsultInput,
+  _resolution_mode: ResolutionMode
 ): Promise<ConsultOutput> {
-  const resolution_mode: ResolutionMode = input.resolution_mode ?? "manual";
+  const model = input.model ?? SECOND_OPINION_MODEL;
+  const single = await withEndpointLock(OLLAMA_URL, () =>
+    callOneBackend(OLLAMA_URL, "ollama", model, input, SECOND_OPINION_TIMEOUT_MS)
+  );
+  return {
+    ...single,
+    disputes: [],
+  };
+}
 
-  // Legacy path: explicit model override OR dual disabled via env.
-  // Preserves pre-2026-04-20 wire shape: no dual_opinion, no analysis,
-  // disputes: [].
-  if (input.model || !SECOND_OPINION_DUAL_ENABLED) {
-    const model = input.model ?? SECOND_OPINION_MODEL;
-    const single = await withEndpointLock(OLLAMA_URL, () =>
-      callOneBackend(OLLAMA_URL, "ollama", model, input, SECOND_OPINION_TIMEOUT_MS)
-    );
-    return {
-      ...single,
-      disputes: [],
-    };
-  }
-
-  // Dual path: fire both GPUs in parallel.
+/**
+ * Dual-dispatch path: fires both GPUs in parallel, runs the Phase B
+ * cheap dispute heuristic, and (if both legs succeed) the Phase C
+ * LLM-judged analysis pass.
+ */
+async function runDual(
+  input: ConsultInput,
+  resolution_mode: ResolutionMode
+): Promise<ConsultOutput> {
   const ollamaPromise = withEndpointLock(OLLAMA_URL, () =>
     callOneBackend(
       OLLAMA_URL,
@@ -824,28 +956,30 @@ export async function runSecondOpinion(
     primaryPromise,
   ]);
 
+  // Shared shape for rejected legs of the dual dispatch. Mirrors the
+  // happy-path shape so downstream code can read either uniformly.
+  const buildUnavailableResult = (reason: unknown, model: string) => {
+    const msg = String(reason);
+    return {
+      second_opinion: `(unavailable: ${msg})`,
+      model,
+      latency_ms: 0,
+      diff_summary: "second-opinion model unavailable",
+      unavailable: true,
+      error: msg,
+    };
+  };
   const ollamaResult =
     ollamaSettled.status === "fulfilled"
       ? ollamaSettled.value
-      : {
-          second_opinion: `(unavailable: ${String(ollamaSettled.reason)})`,
-          model: SECOND_OPINION_MODEL,
-          latency_ms: 0,
-          diff_summary: "second-opinion model unavailable",
-          unavailable: true,
-          error: String(ollamaSettled.reason),
-        };
+      : buildUnavailableResult(ollamaSettled.reason, SECOND_OPINION_MODEL);
   const primaryResult =
     primarySettled.status === "fulfilled"
       ? primarySettled.value
-      : {
-          second_opinion: `(unavailable: ${String(primarySettled.reason)})`,
-          model: SECOND_OPINION_PRIMARY_MODEL,
-          latency_ms: 0,
-          diff_summary: "second-opinion model unavailable",
-          unavailable: true,
-          error: String(primarySettled.reason),
-        };
+      : buildUnavailableResult(
+          primarySettled.reason,
+          SECOND_OPINION_PRIMARY_MODEL
+        );
 
   const dual: DualOpinion = {
     model: primaryResult.model,
@@ -884,4 +1018,16 @@ export async function runSecondOpinion(
   };
   if (analysis) out.analysis = analysis;
   return out;
+}
+
+export async function runSecondOpinion(
+  input: ConsultInput
+): Promise<ConsultOutput> {
+  const resolution_mode: ResolutionMode = input.resolution_mode ?? "manual";
+  // Legacy path is selected by an explicit input.model override or by
+  // the CONSULT_DUAL env kill-switch.
+  if (input.model || !SECOND_OPINION_DUAL_ENABLED) {
+    return runLegacy(input, resolution_mode);
+  }
+  return runDual(input, resolution_mode);
 }

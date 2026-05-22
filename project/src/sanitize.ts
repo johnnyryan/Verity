@@ -58,6 +58,12 @@ export interface InjectionMarker {
   offset: number;
 }
 
+// 2026-05-12 ReDoS hardening: the approval-mode pattern used to have
+// an unbounded `[^.]*?` between the lead phrase and the trigger word,
+// allowing quadratic backtracking on adversarial input. Capped to
+// `[^.]{0,200}?` so the engine bails early on pathological strings.
+// The fake-tool-result pattern is already bounded at 500 chars by the
+// `{0,500}?` quantifier and needs no change.
 const INJECTION_PATTERNS: Array<{ kind: string; re: RegExp }> = [
   // Reviewer-voice annotations inside the answer
   { kind: "reviewer-note", re: /\*{0,2}\s*(critic\s*note|reviewer\s*note|review\s*note|validator\s*note|judge\s*note)\s*:/gi },
@@ -70,7 +76,7 @@ const INJECTION_PATTERNS: Array<{ kind: string; re: RegExp }> = [
   // Embedded verdict JSON
   { kind: "embedded-verdict-json", re: /\{\s*"verdict"\s*:\s*"(pass|warn|fail)"/gi },
   // Approval-mode impostor
-  { kind: "approval-mode", re: /\b(you are now|from now on you are)\s+[^.]*?(validation|approval|verify|check)[^.]{0,80}/gi },
+  { kind: "approval-mode", re: /\b(you are now|from now on you are)\s+[^.]{0,200}?(validation|approval|verify|check)[^.]{0,80}/gi },
   // End-of-answer then new role
   { kind: "end-of-answer-hijack", re: /\[(END\s+OF\s+ANSWER|\/ANSWER|ANSWER\s+FINISHED)\]/gi },
 ];
@@ -79,15 +85,25 @@ export function detectInjectionMarkers(answer: string): InjectionMarker[] {
   if (!answer) return [];
   const markers: InjectionMarker[] = [];
   for (const { kind, re } of INJECTION_PATTERNS) {
-    re.lastIndex = 0;
+    // 2026-05-12: per-call regex instance for concurrency safety. The
+    // module-level RE constants have the `g` flag; mutating their
+    // lastIndex from concurrent /verify calls would corrupt each
+    // other's iteration.
+    const localRe = new RegExp(re.source, re.flags);
     let m: RegExpExecArray | null;
-    while ((m = re.exec(answer)) !== null) {
+    while ((m = localRe.exec(answer)) !== null) {
       markers.push({
         kind,
         snippet: m[0].slice(0, 120),
         offset: m.index,
       });
-      if (m.index === re.lastIndex) re.lastIndex++;
+      // Advance past zero-width matches to avoid infinite loop. A regex
+      // that can match the empty string (e.g. `/^/g`) will return the
+      // same match position forever without this nudge. The
+      // comparison uses `localRe.lastIndex` because the iteration
+      // state lives on the per-call clone, not the shared module-level
+      // pattern.
+      if (m.index === localRe.lastIndex) localRe.lastIndex++;
     }
   }
   // De-duplicate overlapping matches by offset (keep first kind hit).

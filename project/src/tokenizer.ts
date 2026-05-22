@@ -37,7 +37,13 @@ export function countTokens(text: string): number {
   } catch {
     // Defensive fallback: should never fire, but if tiktoken blows up on
     // exotic input, we'd rather over-estimate than crash the pipeline.
-    return Math.ceil(text.length / 3);
+    // `/ 2` is deliberately aggressive — English averages ~4 chars/token,
+    // so this OVER-estimates by ~2x. That matches the "safe over-estimation
+    // is what we want" intent documented above: we use this count to
+    // decide when to truncate prior_context, where under-counting could
+    // overflow the context window. Over-counting just trims a little
+    // extra, which is harmless.
+    return Math.ceil(text.length / 2);
   }
 }
 

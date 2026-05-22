@@ -24,6 +24,52 @@
  */
 export const SERVER_PORT = Number(process.env.VERIFIER_PORT ?? 8090);
 
+/**
+ * [ADAPT] Network interface to bind the MCP server to. Defaults to
+ * localhost (loopback only) because Verity has no authentication and
+ * trusts every caller. Binding to 0.0.0.0 exposes the server to the
+ * local network; only set VERITY_HOST=0.0.0.0 if you understand the
+ * threat model and want to.
+ *
+ * 2026-05-12: was implicitly 0.0.0.0 via `app.listen(port, cb)` with
+ * no host arg. The code-review flagged session-hijack risk if the
+ * server is reachable off-host; localhost binding eliminates that
+ * surface entirely for the default deployment.
+ */
+export const SERVER_HOST = process.env.VERITY_HOST ?? "127.0.0.1";
+
+// ───────────────────────────────────────────────────────────────────────────
+// Request size limits  [security: DoS guards]
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * [ADAPT] Maximum total request body size accepted by the HTTP server,
+ * in bytes. The worker model is untrusted (it can pass arbitrary
+ * strings via the MCP tool call); a generous limit invites trivial DoS
+ * via one huge `answer` or `prior_context`. 4 MB is comfortably more
+ * than any legitimate /verify payload (typical: 10-100 KB) but well
+ * below the previous 50 MB default.
+ */
+export const MAX_REQUEST_BYTES = Number(
+  process.env.VERITY_MAX_REQUEST_BYTES ?? 4 * 1024 * 1024
+);
+
+/**
+ * [ADAPT] Per-field length caps (characters). Enforced in
+ * handleToolCall before the pipeline runs. Beyond these lengths the
+ * critics' context windows would truncate anyway and the latency cost
+ * is borne by the verity process; cleaner to reject up front.
+ */
+export const MAX_QUESTION_CHARS = Number(
+  process.env.VERITY_MAX_QUESTION_CHARS ?? 32_000
+);
+export const MAX_ANSWER_CHARS = Number(
+  process.env.VERITY_MAX_ANSWER_CHARS ?? 200_000
+);
+export const MAX_PRIOR_CONTEXT_CHARS = Number(
+  process.env.VERITY_MAX_PRIOR_CONTEXT_CHARS ?? 800_000
+);
+
 // ───────────────────────────────────────────────────────────────────────────
 // Upstream model servers
 // ───────────────────────────────────────────────────────────────────────────
@@ -84,6 +130,27 @@ export const WORKER_MODEL_NAME =
   process.env.WORKER_MODEL ?? "qwen/qwen3.5-9b";
 
 /**
+ * [ADAPT] Worker endpoint + API key. Default to the local LM Studio server
+ * (its key is ignored). These are the ONLY knobs needed to point the
+ * worker-dependent deep/deeper signals (consistency re-sampling, LLM claim
+ * extraction, perplexity regeneration) at a different backend — including a
+ * CLOUD model:
+ *
+ *   OpenAI:   WORKER_ENDPOINT=https://api.openai.com/v1
+ *             WORKER_API_KEY=sk-...   WORKER_MODEL=gpt-4o
+ *   Anthropic / Gemini (not OpenAI-compatible): run an OpenAI-compatible
+ *             gateway (e.g. LiteLLM) and point WORKER_ENDPOINT at it.
+ *
+ * Standard /verify never calls the worker — it only reads the question and
+ * answer text — so a cloud worker needs no change there. See the readme
+ * section "Cloud model as the worker".
+ */
+export const WORKER_ENDPOINT =
+  process.env.WORKER_ENDPOINT ?? LM_STUDIO_URL;
+export const WORKER_API_KEY =
+  process.env.WORKER_API_KEY ?? "lm-studio";
+
+/**
  * [ADAPT ★] Critic A model tag (Google-family critic on Ollama/AMD).
  *
  * History on this machine:
@@ -99,7 +166,19 @@ export const WORKER_MODEL_NAME =
  *        Both critics stay resident, no eviction, no cold-load per call.
  */
 export const CRITIC_A_MODEL =
-  process.env.CRITIC_A_MODEL ?? "granite3.2:8b";
+  process.env.CRITIC_A_MODEL ?? "granite4.1:8b";
+// 2026-05-12: bumped from granite3.2:8b (Mar 2025) to granite4.1:8b
+// (Apr 29 2026). The newer model is post-trained with LLM-as-Judge
+// filtering — literally the critic role — and reports IFEval 87.1,
+// BFCL V3 68.3, both up from Granite 3.2.
+//
+// VRAM note: granite4.1:8b is ~5.3 GB at Q4_K_M; combined with the
+// 3 GB Ministral-3 3B Critic B, the pair uses ~8.3 GB on an 8 GB
+// card — tight. If KV pressure shows (Ollama evicting one critic
+// mid-call, cold-load latency on every other /verify), switch to
+// `granite4.1:8b-q3_K_M` (~4.3 GB) for a combined ~7.3 GB footprint
+// with KV-cache headroom intact. Set via:
+//   export CRITIC_A_MODEL=granite4.1:8b-q3_K_M
 
 /**
  * [ADAPT ★] Critic B model tag in Ollama.
@@ -112,7 +191,14 @@ export const CRITIC_A_MODEL =
  * giving real family diversity. Only 2.1 GB so plenty of VRAM headroom.
  */
 export const CRITIC_B_MODEL =
-  process.env.CRITIC_B_MODEL ?? "granite3.2:2b";
+  process.env.CRITIC_B_MODEL ?? "ministral-3:3b";
+// 2026-05-12: bumped from granite3.2:2b (Mar 2025) to ministral-3:3b
+// (Dec 2025 / "instruct-2512" build, Mistral AI). Restores the
+// cross-family axis that the old "both Granite" pair gave up: now
+// Critic A is IBM, Critic B is Mistral, worker is Qwen — three
+// distinct pretraining corpora and post-training recipes. Apache
+// 2.0 license, 256k native context (irrelevant for a critic but
+// good), tool-calling validated with MCP demos. ~2-3 GB at Q4_K_M.
 
 /**
  * [ADAPT ★] Critic C model tag in Ollama.
@@ -222,6 +308,53 @@ export const WARN_SEVERITY_THRESHOLD = 2;
 export const MAX_UNAVAILABLE_CRITICS = 1;
 
 /**
+ * [ADAPT] Opt-in weighted-vote override (default OFF).
+ *
+ * When ON, a higher-weight critic's `pass` can outvote a lower-weight
+ * critic's `fail`. The 2026-04-18 sweep found this was a wash on the
+ * audit corpus: the lone-2B-fail downgrade flipped `code-clean`
+ * (false positive) from MISS to warn (better) but also flipped
+ * `code-subtle-bug` (real bug only the 2B caught) from OK to warn
+ * (worse). 50/50 on which critic is right when they disagree at the
+ * extremes, so kept default OFF.
+ *
+ * Set AGGREGATOR_WEIGHTED_VOTE=1 in env to opt in for A/B work.
+ *
+ * 2026-05-12: moved from a direct process.env read inside aggregator.ts
+ * to honour the "all knobs in config.ts" contract.
+ */
+export const AGGREGATOR_WEIGHTED_VOTE =
+  process.env.AGGREGATOR_WEIGHTED_VOTE === "1";
+
+/**
+ * Truncation budgets used by the human-readable Markdown renderer.
+ *
+ * Table cells get tight budgets so the table stays scannable; bullets
+ * in the Findings list get larger budgets so the text isn't clipped
+ * mid-thought.
+ *
+ * 2026-05-12 (F3): these were inline magic numbers scattered through
+ * aggregator.ts. Promoted here so a renderer-wide widening is one
+ * edit instead of seven.
+ */
+export const RENDER_CELL_TOPIC_CHARS = 120;     // critic table top-concern cell
+export const RENDER_CELL_CONCERN_CHARS = 140;   // dispute table concern cell
+export const RENDER_FINDING_CONCERN_CHARS = 800; // Findings bullet, critic concern
+export const RENDER_FINDING_EXTRA_CHARS = 600;  // Findings bullet, "also:" / fix
+export const RENDER_FINDING_NLI_CLAIM_CHARS = 1000; // NLI claim text in Findings
+export const RENDER_FINDING_RECOMPUTE_CHARS = 400;  // recompute mismatch expr
+
+/**
+ * [ADAPT] Echo the verified answer at the top of the /verify block. Default
+ * OFF: the block shows only the critics table and the bold conclusion (the
+ * worker shows its own answer per the FLOW / system prompt). Set
+ * VERITY_SUMMARY_ECHO_ANSWER=1 to restate the answer inside the block, useful
+ * for a worker that calls verify_answer without first emitting a visible answer.
+ */
+export const SUMMARY_ECHO_ANSWER =
+  process.env.VERITY_SUMMARY_ECHO_ANSWER === "1";
+
+/**
  * Divergence threshold (0–1) at or above which the consistency check alone
  * flips the consensus to 'fail'. 0.5 means "more than half the answer's
  * claims were contradicted or unsupported across alternate samples".
@@ -277,11 +410,11 @@ export const NLI_REQUIRE_CONTEXT =
 
 /**
  * [ADAPT] Ollama model tag used by the LLM-based claim-checker when
- * NLI_IMPL=llm. Defaults to the small-and-fast Granite critic already
- * loaded on AMD.
+ * NLI_IMPL=llm. Defaults to the small-and-fast critic already loaded on AMD
+ * (Critic B, Ministral 3B).
  */
 export const NLI_LLM_MODEL =
-  process.env.NLI_LLM_MODEL ?? "granite3.2:2b";
+  process.env.NLI_LLM_MODEL ?? "ministral-3:3b";
 
 /**
  * [ADAPT] HuggingFace model id for the NLI classifier.
@@ -377,6 +510,81 @@ export const PERPLEXITY_LOW_CONFIDENCE_LOGPROB = -3.0;
  */
 export const PERPLEXITY_MAX_FLAGGED_SPANS = 8;
 
+/**
+ * [ADAPT] Per-token alternatives requested from /v1/responses. We only need
+ * the chosen token's logprob, so 1 keeps the payload small. Raise if you
+ * want to surface the runner-up tokens in the confidence note.
+ */
+export const PERPLEXITY_RESPONSES_TOP_LOGPROBS = Number(
+  process.env.VERITY_RESPONSES_TOP_LOGPROBS ?? 1
+);
+
+/**
+ * [ADAPT] Max tokens for the /v1/responses regeneration used to obtain
+ * logprobs. Mirrors the worker's typical answer length.
+ */
+export const PERPLEXITY_REGEN_MAX_TOKENS = Number(
+  process.env.VERITY_REGEN_MAX_TOKENS ?? 800
+);
+
+// ───────────────────────────────────────────────────────────────────────────
+// Generation-confidence gate (logprob-driven escalation)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// Maps a generation's per-token logprobs to a confidence band, and each band
+// to a recommended verify depth:
+//   ok       → (nothing)
+//   mild     → /verify       (standard)
+//   low      → /verifydeep
+//   very_low → /verifydeeper
+//
+// A band fires if ANY of its three axes trips; the worst matched band wins.
+//   - local axis : the single weakest token's logprob (catches one bad
+//     name/number/date in an otherwise fluent answer)
+//   - global axis: whole-answer perplexity
+//   - density axis: fraction of tokens at/below PERPLEXITY_LOW_CONFIDENCE_LOGPROB
+//
+// [ADAPT] These defaults are first-pass and uncalibrated against a labelled
+// corpus — tune once you have ground-truth confident/unconfident answers.
+
+/** Master switch for the confidence gate. Set VERITY_CONFIDENCE_GATE=0 off. */
+export const CONFIDENCE_GATE_ENABLED =
+  (process.env.VERITY_CONFIDENCE_GATE ?? "1") !== "0";
+
+// Local axis: weakest single-token logprob thresholds (more negative = worse).
+// -3.0 ≈ 5% prob, -4.5 ≈ 1.1%, -6.0 ≈ 0.25%.
+export const CONFIDENCE_MILD_MIN_LOGPROB = Number(
+  process.env.VERITY_CONF_MILD_MIN_LOGPROB ?? -3.0
+);
+export const CONFIDENCE_LOW_MIN_LOGPROB = Number(
+  process.env.VERITY_CONF_LOW_MIN_LOGPROB ?? -4.5
+);
+export const CONFIDENCE_VERYLOW_MIN_LOGPROB = Number(
+  process.env.VERITY_CONF_VERYLOW_MIN_LOGPROB ?? -6.0
+);
+
+// Global axis: whole-answer perplexity thresholds (higher = worse).
+export const CONFIDENCE_MILD_PERPLEXITY = Number(
+  process.env.VERITY_CONF_MILD_PERPLEXITY ?? 2.2
+);
+export const CONFIDENCE_LOW_PERPLEXITY = Number(
+  process.env.VERITY_CONF_LOW_PERPLEXITY ?? 4.0
+);
+export const CONFIDENCE_VERYLOW_PERPLEXITY = Number(
+  process.env.VERITY_CONF_VERYLOW_PERPLEXITY ?? 8.0
+);
+
+// Density axis: fraction of low-confidence tokens (higher = worse).
+export const CONFIDENCE_MILD_RATIO = Number(
+  process.env.VERITY_CONF_MILD_RATIO ?? 0.05
+);
+export const CONFIDENCE_LOW_RATIO = Number(
+  process.env.VERITY_CONF_LOW_RATIO ?? 0.12
+);
+export const CONFIDENCE_VERYLOW_RATIO = Number(
+  process.env.VERITY_CONF_VERYLOW_RATIO ?? 0.25
+);
+
 // ───────────────────────────────────────────────────────────────────────────
 // Logging
 // ───────────────────────────────────────────────────────────────────────────
@@ -424,21 +632,15 @@ export const PIPELINE_TIMEOUT_MS = 180_000;
  * [ADAPT ★] Model used for the /second parallel consult. Must be available
  * on the Ollama server (`ollama list`).
  *
- * Default `granite3.2:8b` is chosen because it is already loaded on AMD in
- * the current deployment, so no cold-load hit on first use. For stronger
- * cross-family contrast with Qwen (Alibaba), override to a different
- * provider — `phi4-mini:3.8b` (Microsoft), `gemma3:4b` (Google), or
- * `llama3.2:3b` (Meta).
- *
- * Rationale for starting with granite rather than phi4-mini:
- *   - already resident in AMD VRAM (no ~2 s cold-load on first call)
- *   - 5.5 GB fits alongside the 2B critic within the 8 GB AMD budget
- *   - different generation than the primary's training distribution
- *     (IBM vs Alibaba), which is the practical diversity axis the project
- *     exploits
+ * Default `granite4.1:8b` is the strongest local critic (it is also Critic A),
+ * already resident on AMD, so there is no cold-load hit on first use, and it is
+ * a different family from the Qwen worker. The /second model generates a full
+ * answer, not just a critique, so the larger of the two new critics is the
+ * better pick (Ministral 3B is the lightweight one). For more contrast, override
+ * to another provider, e.g. `gemma4:e4b` (Google) or `phi4-mini:3.8b` (Microsoft).
  */
 export const SECOND_OPINION_MODEL =
-  process.env.SECOND_OPINION_MODEL ?? "granite3.2:8b";
+  process.env.SECOND_OPINION_MODEL ?? "granite4.1:8b";
 
 /**
  * [ADAPT] Upper bound on second-opinion length. 400 is enough for a focused
@@ -460,7 +662,7 @@ export const SECOND_OPINION_TEMPERATURE = Number(
 /**
  * [ADAPT] Timeout (ms) on a single /second call. Generous because the
  * selected second model may be cold on first invocation (2–5 s for
- * granite3.2:8b, 1–2 s for smaller candidates).
+ * granite4.1:8b, 1–2 s for smaller candidates).
  */
 export const SECOND_OPINION_TIMEOUT_MS = Number(
   process.env.SECOND_OPINION_TIMEOUT_MS ?? 30_000
@@ -560,4 +762,93 @@ export const SECOND_OPINION_ANALYSIS_TIMEOUT_MS = Number(
  */
 export const SECOND_OPINION_ANALYSIS_MAX_TOKENS = Number(
   process.env.SECOND_OPINION_ANALYSIS_MAX_TOKENS ?? 2000
+);
+
+// ───────────────────────────────────────────────────────────────────────────
+// Confidence proxy  (transparent OpenAI-compatible front-door)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The confidence proxy (src/proxy/server.ts) is a small HTTP server that an
+// external OpenAI-compatible chat client (Open WebUI, Jan, LibreChat,
+// AnythingLLM, ...) points at INSTEAD of LM Studio's http://localhost:1234/v1.
+// It intercepts POST /v1/chat/completions, routes the GENERATION through the
+// upstream's /v1/responses endpoint (the only logprobs-bearing path on LM
+// Studio), scores the returned tokens with the shared confidence classifier,
+// and appends the low-confidence note to the answer when the band is not "ok".
+// Every other path is forwarded transparently.
+//
+// Why a separate process and port: the built-in chat UIs (the LM Studio app,
+// `ollama run`) are sealed and cannot be intercepted. The proxy is the ONLY
+// way to enforce the confidence gate on EVERY answer, and it only works for
+// clients that talk to the API port. See docs/confidence-proxy.md.
+//
+// [ADAPT] The upstream MUST expose /v1/responses with logprobs. LM Studio
+// (0.3.x+) does; Ollama currently does NOT, so this proxy targets LM
+// Studio-backed setups for now.
+
+/**
+ * [ADAPT] Port the confidence proxy listens on. Defaults to 1235 to sit one
+ * above LM Studio's standard 1234, so the two run side by side: clients point
+ * at the proxy (1235), the proxy forwards to LM Studio (1234). Point your
+ * external client's "OpenAI-compatible API base URL" at
+ * http://localhost:1235/v1.
+ */
+export const PROXY_PORT = Number(process.env.VERITY_PROXY_PORT ?? 1235);
+
+/**
+ * [ADAPT] Network interface the proxy binds to. Defaults to localhost
+ * (loopback only), matching SERVER_HOST's reasoning: the proxy has no
+ * authentication and forwards an upstream key, so it should not be reachable
+ * off-host by default. Set VERITY_PROXY_HOST=0.0.0.0 only if you deliberately
+ * want a LAN client (e.g. a phone running a chat app) to reach it and you
+ * understand the threat model.
+ */
+export const PROXY_HOST = process.env.VERITY_PROXY_HOST ?? "127.0.0.1";
+
+/**
+ * [ADAPT] Upstream OpenAI-compatible base URL the proxy forwards to. Defaults
+ * to LM_STUDIO_URL (http://localhost:1234/v1). This is the backend that must
+ * expose /v1/responses with logprobs. To put the proxy in front of a
+ * different LM Studio host, or a llama-server / vLLM build that implements the
+ * Responses API, change this.
+ */
+export const PROXY_UPSTREAM_URL =
+  process.env.VERITY_PROXY_UPSTREAM_URL ?? LM_STUDIO_URL;
+
+/**
+ * [ADAPT] Per-token alternatives the proxy requests from /v1/responses. The
+ * confidence classifier only reads the chosen token's logprob, so 1 keeps the
+ * payload small. Mirrors PERPLEXITY_RESPONSES_TOP_LOGPROBS; kept separate so
+ * the proxy can be tuned without touching the /verify perplexity signal.
+ */
+export const PROXY_RESPONSES_TOP_LOGPROBS = Number(
+  process.env.VERITY_PROXY_RESPONSES_TOP_LOGPROBS ?? 1
+);
+
+/**
+ * [ADAPT] Default cap on generated tokens when an incoming chat-completions
+ * request does not specify max_tokens. A finite default keeps a client that
+ * omits the field from letting the model run away. Generous enough for a long
+ * prose answer.
+ */
+export const PROXY_DEFAULT_MAX_OUTPUT_TOKENS = Number(
+  process.env.VERITY_PROXY_DEFAULT_MAX_OUTPUT_TOKENS ?? 2048
+);
+
+/**
+ * [ADAPT] Wall-clock timeout (ms) for a single upstream /v1/responses
+ * generation initiated by the proxy. Sized for a long answer on a local
+ * model; raise for very large max_tokens or a slow/cold backend.
+ */
+export const PROXY_UPSTREAM_TIMEOUT_MS = Number(
+  process.env.VERITY_PROXY_UPSTREAM_TIMEOUT_MS ?? 120_000
+);
+
+/**
+ * [ADAPT] Maximum request body (bytes) the proxy accepts. A chat-completions
+ * body carries the whole conversation, so this is larger than the MCP
+ * server's MAX_REQUEST_BYTES. Still a DoS guard against an unbounded body.
+ */
+export const PROXY_MAX_REQUEST_BYTES = Number(
+  process.env.VERITY_PROXY_MAX_REQUEST_BYTES ?? 16 * 1024 * 1024
 );

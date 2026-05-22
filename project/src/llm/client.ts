@@ -25,6 +25,7 @@
  */
 
 import OpenAI from "openai";
+import { createHash } from "node:crypto";
 
 const clientCache = new Map<string, OpenAI>();
 
@@ -32,16 +33,26 @@ const clientCache = new Map<string, OpenAI>();
  * Get (or lazily allocate) an OpenAI client for the given endpoint.
  *
  * Calls with the same `endpoint` + `apiKey` share an instance.
+ *
+ * 2026-05-12 (F2): the cache key used to be the literal
+ * `${endpoint}|${apiKey}`, which meant the API key sat in the Map's
+ * key space and would surface verbatim in any memory dump or core
+ * file. Hash the key so the cache still works (same input → same
+ * cache key → same client instance) but the credential itself never
+ * appears in the key. SHA-256 of a short string is fast and
+ * collision-free for this use.
  */
 export function getLlmClient(opts: {
   endpoint: string;
   apiKey: string;
 }): OpenAI {
-  const key = `${opts.endpoint}|${opts.apiKey}`;
-  let c = clientCache.get(key);
+  const keyHash = createHash("sha256")
+    .update(`${opts.endpoint}|${opts.apiKey}`)
+    .digest("hex");
+  let c = clientCache.get(keyHash);
   if (!c) {
     c = new OpenAI({ baseURL: opts.endpoint, apiKey: opts.apiKey });
-    clientCache.set(key, c);
+    clientCache.set(keyHash, c);
   }
   return c;
 }

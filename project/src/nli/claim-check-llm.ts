@@ -16,6 +16,9 @@
 import { NLI_LLM_MODEL, OLLAMA_URL, VERBOSE_LOGGING } from "../config.js";
 import type { NliResult } from "../types.js";
 import { extractClaims } from "./extract-claims.js";
+import { getLlmClient } from "../llm/client.js";
+import { findBalancedJsonObject } from "../critics/parse.js";
+import { stripReasoningTraces } from "../sanitize.js";
 
 const SYSTEM_PROMPT = `
 You are a claim verification classifier. Given a single CLAIM and a CONTEXT
@@ -54,11 +57,18 @@ interface LlmVerdict {
 
 function parseLlmVerdict(text: string): LlmVerdict | null {
   if (!text) return null;
-  // Extract the first JSON object; tolerate extra whitespace / fences.
-  const match = text.match(/\{[\s\S]*?\}/);
-  if (!match) return null;
+  // 2026-05-12: was `text.match(/\{[\s\S]*?\}/)` — fragile when prose
+  // contains a `{...}` snippet before the real JSON object, when a
+  // reasoning trace precedes the verdict, or when the model emits
+  // markdown fences. Use the shared balanced-brace finder and require
+  // the `label` key so we pick the right object even on a chatty model.
+  const cleaned = stripReasoningTraces(text)
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "");
+  const candidate = findBalancedJsonObject(cleaned, { requireKey: "label" });
+  if (!candidate) return null;
   try {
-    const obj = JSON.parse(match[0]);
+    const obj = JSON.parse(candidate);
     const raw = String(obj.label ?? "").toLowerCase();
     let label: LlmVerdict["label"];
     if (raw.includes("contradict")) label = "contradicted";
@@ -76,32 +86,33 @@ async function classifyClaim(
   claim: string,
   context: string
 ): Promise<LlmVerdict | null> {
-  const body = {
-    model: NLI_LLM_MODEL,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserPrompt(claim, context) },
-    ],
-    temperature: 0.0,
-    max_tokens: 80,
-    stream: false,
-  };
-  const res = await fetch(`${OLLAMA_URL}/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
+  // 2026-05-12: was raw `fetch(\`${OLLAMA_URL}/chat/completions\`)`. If
+  // OLLAMA_URL doesn't end in `/v1` the request 404s and every LLM-NLI
+  // call silently returns null. Routing through the shared client
+  // factory keeps URL handling, retries, and auth headers consistent
+  // with every other Ollama / LM Studio call in this codebase.
+  try {
+    const response = await getLlmClient({
+      endpoint: OLLAMA_URL,
+      apiKey: "ollama",
+    }).chat.completions.create({
+      model: NLI_LLM_MODEL,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: buildUserPrompt(claim, context) },
+      ],
+      temperature: 0.0,
+      max_tokens: 80,
+      stream: false,
+    });
+    const text = response.choices[0]?.message?.content ?? "";
+    return parseLlmVerdict(text);
+  } catch (err) {
     if (VERBOSE_LOGGING) {
-      console.error(
-        `[NLI-LLM] Ollama ${res.status} ${await res.text().catch(() => "")}`
-      );
+      console.error("[NLI-LLM] classifyClaim error:", err);
     }
     return null;
   }
-  const data: any = await res.json().catch(() => null);
-  const text = data?.choices?.[0]?.message?.content ?? "";
-  return parseLlmVerdict(text);
 }
 
 const CONTRADICTION_MIN_CONF = 0.55;

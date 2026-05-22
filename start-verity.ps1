@@ -39,7 +39,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ---─ Paths ---------------------------------------------------------------------------------------------------─
+# ---- Paths ----------------------------------------------------------------------------------------------------
 $Root              = Split-Path -Parent $PSCommandPath
 $OllamaLauncher    = Join-Path $Root 'CLI\ollama-amd.ps1'
 $VerityDist        = Join-Path $Root 'dist\index.js'
@@ -51,7 +51,7 @@ $LauncherLog       = Join-Path $StateDir 'launcher.log'
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 
-# ---─ Logging ------------------------------------------------------------------------------------------------─
+# ---- Logging -------------------------------------------------------------------------------------------------
 function Write-Log([string]$msg, [string]$level = 'INFO') {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line  = "$stamp [$level] $msg"
@@ -64,7 +64,7 @@ function Write-Log([string]$msg, [string]$level = 'INFO') {
     }
 }
 
-# ---─ Process discovery ---------------------------------------------------------------------------------
+# ---- Process discovery ---------------------------------------------------------------------------------
 function Find-Node {
     $cmd = Get-Command node -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -108,131 +108,22 @@ function Test-VerityHealth {
     } catch { return $false }
 }
 
-# --- Transactional Qwen-config management -----------------------------------
-# Verity needs Qwen loaded with a tighter context window + q8_0 KV cache
-# to avoid the VRAM-pressure crash documented in 2026-05-11. But other
-# users (Lore indexing) want Qwen at its native long-context config.
+# --- Transactional Qwen-config management (removed 2026-05-12) ---------------
+# The Apply-VerityQwenConfig / Revert-VerityQwenConfig helpers that used
+# to live here wrote a `load.fields: []` JSON config to LM Studio's
+# per-model default-config directory. They were disabled on 2026-05-11
+# because LM Studio's prediction path then failed schema validation on
+# llm.prediction.maxPredictedTokens (must be >= 1) — the empty
+# operation.fields array meant no max_tokens was set, breaking chat.
 #
-# Rule: on Verity Start we SNAPSHOT whatever Qwen's per-model load
-# defaults currently are, then write Verity's preferred values. On Verity
-# Stop we RESTORE the snapshot and delete the backup. Lore (or anyone
-# else) gets back exactly the config it had before Verity loaded -- no
-# collateral damage.
-#
-# Snapshot files are kept alongside the live config files with a
-# `.verity-backup` suffix. If a snapshot already exists when Start runs,
-# we don't overwrite it -- the existing backup IS the original pre-Verity
-# state. Idempotent re-Start is safe.
+# The whole pattern was a workaround for the Qwen-on-NVIDIA VRAM-pressure
+# crash that has since been fixed via the AMD-pinned Ollama launcher
+# (CLI/ollama-amd.ps1) keeping critics off the NVIDIA card. Removed
+# entirely on 2026-05-12 (E17). If you ever need per-model LM Studio
+# config management, git history before this commit has the full
+# Apply/Revert pair.
 
-$QwenConfigDir = Join-Path $env:USERPROFILE '.lmstudio\.internal\user-concrete-model-default-config\qwen\qwen3.5-9b@lmstudio-community\Qwen3.5-9B-GGUF'
-$QwenConfigFiles = @(
-    'Qwen3.5-9B-Q8_0.gguf.json',
-    'Qwen3.5-9B-Q4_K_M.gguf.json'
-)
-
-# What Verity wants while it's loaded: 64k context (matches the design doc
-# target of "up to 64k"), q8_0 KV cache (halves cache footprint vs f16),
-# model stays resident. If Lore needs 128k, this is still less than half
-# the previous 256k default but enough for the typical Verity workload.
-$VerityPreferredQwenConfig = @'
-{
-  "preset": "",
-  "operation": {
-    "fields": []
-  },
-  "load": {
-    "fields": [
-      {
-        "key": "llm.load.contextLength",
-        "value": 65536
-      },
-      {
-        "key": "llm.load.llama.keepModelInMemory",
-        "value": true
-      },
-      {
-        "key": "llm.load.llama.kCacheQuantizationType",
-        "value": {
-          "checked": true,
-          "value": "q8_0"
-        }
-      },
-      {
-        "key": "llm.load.llama.vCacheQuantizationType",
-        "value": {
-          "checked": true,
-          "value": "q8_0"
-        }
-      }
-    ]
-  }
-}
-'@
-
-function Apply-VerityQwenConfig {
-    if (-not (Test-Path $QwenConfigDir)) {
-        Write-Log "Qwen config dir not found: $QwenConfigDir -- skipping config snapshot." 'WARN'
-        return
-    }
-    foreach ($fname in $QwenConfigFiles) {
-        $live   = Join-Path $QwenConfigDir $fname
-        $backup = "$live.verity-backup"
-        if (-not (Test-Path $live)) {
-            Write-Log "Qwen config file missing: $live -- skipping." 'WARN'
-            continue
-        }
-        if (Test-Path $backup) {
-            Write-Log "Backup already present at $backup -- keeping it (will not re-snapshot)."
-        } else {
-            Copy-Item -Path $live -Destination $backup -Force
-            Write-Log "Snapshotted pre-Verity Qwen config: $fname -> .verity-backup"
-        }
-        # UTF-8 with no BOM, as LM Studio's JSON parser expects.
-        [System.IO.File]::WriteAllText($live, $VerityPreferredQwenConfig)
-        Write-Log "Applied Verity Qwen config (64k ctx, q8_0 KV): $fname" 'OK'
-    }
-    Write-Log "Note: in-memory Qwen instance keeps the OLD config until next reload."
-    Write-Log "  Eject Qwen from LM Studio (or let it idle-evict) to pick up Verity's settings."
-}
-
-function Get-VerityBackupExists {
-    # True if at least one .verity-backup file is present (i.e. Verity
-    # currently considers itself "loaded" w.r.t. Qwen config).
-    if (-not (Test-Path $QwenConfigDir)) { return $false }
-    foreach ($fname in $QwenConfigFiles) {
-        if (Test-Path (Join-Path $QwenConfigDir "$fname.verity-backup")) {
-            return $true
-        }
-    }
-    return $false
-}
-
-function Revert-VerityQwenConfig {
-    if (-not (Test-Path $QwenConfigDir)) {
-        Write-Log "Qwen config dir not found: $QwenConfigDir -- nothing to revert." 'INFO'
-        return
-    }
-    $any = $false
-    foreach ($fname in $QwenConfigFiles) {
-        $live   = Join-Path $QwenConfigDir $fname
-        $backup = "$live.verity-backup"
-        if (-not (Test-Path $backup)) {
-            continue
-        }
-        Copy-Item -Path $backup -Destination $live -Force
-        Remove-Item -Path $backup -Force
-        Write-Log "Restored pre-Verity Qwen config: $fname" 'OK'
-        $any = $true
-    }
-    if (-not $any) {
-        Write-Log "No Verity backup files present -- Qwen config was not modified by Verity. Nothing to revert."
-    } else {
-        Write-Log "Note: in-memory Qwen instance keeps Verity's config until next reload."
-        Write-Log "  Eject Qwen from LM Studio (or let it idle-evict) for Lore-compatible settings."
-    }
-}
-
-# ---─ Verity MCP server ---------------------------------------------------------------------------------
+# ---- Verity MCP server ---------------------------------------------------------------------------------
 function Start-Verity {
     $existing = Get-VerityPid
     if ($existing -and (Test-VerityHealth)) {
@@ -266,7 +157,7 @@ function Start-Verity {
                           -RedirectStandardError  $VerityErrLog `
                           -WindowStyle Hidden -PassThru
     Set-Content -Path $VerityPidFile -Value $proc.Id
-    Write-Log "Verity launched (PID $($proc.Id)). Waiting for /health…"
+    Write-Log "Verity launched (PID $($proc.Id)). Waiting for /health..."
 
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
@@ -305,7 +196,7 @@ function Stop-Verity {
     Write-Log "Verity MCP server stopped. ~$ramMb MB CPU RAM released." 'OK'
 }
 
-# ---─ Composite status ---------------------------------------------------------------------------------─
+# ---- Composite status ----------------------------------------------------------------------------------
 function Show-Status {
     Write-Host ''
     Write-Host '======== Verity stack status ========' -ForegroundColor Cyan
@@ -335,7 +226,7 @@ function Show-Status {
     Write-Host ''
 }
 
-# ---─ Desktop shortcut installer ------------------------------------------------------------------─
+# ---- Desktop shortcut installer -------------------------------------------------------------------
 function Install-DesktopShortcut {
     $desktop = [Environment]::GetFolderPath('Desktop')
     if (-not $desktop) {
@@ -440,7 +331,7 @@ function Confirm-EverythingOff {
     Write-Host ''
 }
 
-# ---─ Dispatch ---------------------------------------------------------------------------------------------─
+# ---- Dispatch ----------------------------------------------------------------------------------------------
 if ($InstallShortcut) {
     Install-DesktopShortcut
     exit 0
@@ -462,14 +353,8 @@ switch ($Action) {
             Write-Log "Ollama launcher exited with code $LASTEXITCODE -- aborting Verity start." 'ERROR'
             exit $LASTEXITCODE
         }
-        # DISABLED 2026-05-11: Apply-VerityQwenConfig wrote a load config
-        # with empty `operation.fields`, which made LM Studio's prediction
-        # path fail schema validation on `llm.prediction.maxPredictedTokens`
-        # (must be >= 1) on the next chat completion against Qwen. Until
-        # we can derive a sensible operation.fields default, leave the
-        # JSON config untouched. Apply-VerityQwenConfig/Revert-VerityQwenConfig
-        # are still defined below for future re-enable.
-        # Apply-VerityQwenConfig
+        # Apply-VerityQwenConfig was removed 2026-05-12 (E17); see
+        # the comment block at top of file for history.
         Start-Verity
         Show-Status
     }
@@ -479,9 +364,7 @@ switch ($Action) {
         if (Test-Path $OllamaLauncher) {
             & powershell.exe -ExecutionPolicy Bypass -NoProfile -File $OllamaLauncher -Action Stop
         }
-        # DISABLED 2026-05-11 alongside Apply-VerityQwenConfig above --
-        # there's nothing to revert because Start didn't apply anything.
-        # Revert-VerityQwenConfig
+        # Revert-VerityQwenConfig was removed 2026-05-12 (E17).
         # Wait briefly for runner processes to finish releasing VRAM,
         # then confirm nothing Verity-related remains on either GPU or CPU.
         Start-Sleep -Seconds 1

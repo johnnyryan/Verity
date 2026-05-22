@@ -6,12 +6,24 @@
 #
 # Default install location is %USERPROFILE%\Verity. Override with:
 #   .\install-verity.ps1 -InstallPath C:\path\you\prefer
+#
+# To install from a fork, override the repo URL:
+#   .\install-verity.ps1 -RepoUrl https://github.com/<you>/Verity.git
+# The URL must be on github.com (https) by ValidatePattern below.
 
 param(
     [string]$InstallPath = "$env:USERPROFILE\Verity",
+
+    # 2026-05-12: ValidatePattern guards against -RepoUrl pointing at
+    # an untrusted host. `npm install` and `npm run build` run
+    # arbitrary post-install / build scripts from whatever code was
+    # cloned, so blindly accepting any URL would let a caller turn
+    # this installer into a remote-code-execution vector.
+    [ValidatePattern('^https://github\.com/[^/\s]+/[^/\s]+\.git$')]
     [string]$RepoUrl     = "https://github.com/johnnyryan/Verity.git"
 )
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 function Test-Command([string]$Name) {

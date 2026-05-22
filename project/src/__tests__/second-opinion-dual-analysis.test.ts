@@ -30,6 +30,7 @@ import {
   callOneBackend,
   computeDisputes,
   extractAnalysisJson,
+  MAX_ANALYSIS_DISPUTES,
   renderDisputesTable,
   renderDisputesMarkdown,
   runAnalysisPass,
@@ -171,7 +172,7 @@ test("extractAnalysisJson: 'Thinking Process:' preamble without tags skipped to 
 // ─────────────────────────────────────────────────────────────────────────
 
 test("renderDisputesTable: empty -> HTML fallback", () => {
-  const out = renderDisputesTable([], "qwen/qwen3.5-9b");
+  const out = renderDisputesTable([], "qwen/qwen3.5-9b", "granite3.2:8b");
   assert.equal(out, "<p><em>No disputes — models agreed.</em></p>");
 });
 
@@ -183,14 +184,14 @@ test("renderDisputesTable: HTML-escapes cell content, newlines -> <br>, emits va
       nvidia_position: "uses <angle> \"quotes\"",
     },
   ];
-  const out = renderDisputesTable(disputes, "qwen/qwen3.5-9b");
+  const out = renderDisputesTable(disputes, "qwen/qwen3.5-9b", "granite3.2:8b");
   // Structural bones
   assert.ok(out.startsWith("<table"));
   assert.ok(out.endsWith("</table>"));
   assert.ok(out.includes("<thead>"));
   assert.ok(out.includes("<tbody>"));
   assert.ok(out.includes(">Topic</th>"));
-  assert.ok(out.includes(">AMD (Granite 3.2 8B)</th>"));
+  assert.ok(out.includes(">AMD (granite3.2:8b)</th>"));
   assert.ok(out.includes(">NVIDIA (qwen/qwen3.5-9b)</th>"));
   // Cell escaping
   assert.ok(out.includes("time &amp; scope"));          // &
@@ -206,7 +207,7 @@ test("renderDisputesTable: HTML-escapes cell content, newlines -> <br>, emits va
 // ─────────────────────────────────────────────────────────────────────────
 
 test("renderDisputesMarkdown: empty -> markdown italic fallback", () => {
-  const out = renderDisputesMarkdown([], "qwen/qwen3.5-9b");
+  const out = renderDisputesMarkdown([], "qwen/qwen3.5-9b", "granite3.2:8b");
   assert.equal(out, "_No disputes — models agreed._");
 });
 
@@ -218,11 +219,11 @@ test("renderDisputesMarkdown: escapes pipes, newlines -> <br>, bolds topic", () 
       nvidia_position: "has | pipe",
     },
   ];
-  const out = renderDisputesMarkdown(disputes, "qwen/qwen3.5-9b");
+  const out = renderDisputesMarkdown(disputes, "qwen/qwen3.5-9b", "granite3.2:8b");
   const lines = out.split("\n");
   // header + separator + 1 row
   assert.equal(lines.length, 3);
-  assert.ok(lines[0].startsWith("| Topic | AMD (Granite 3.2 8B) | NVIDIA (qwen/qwen3.5-9b) |"));
+  assert.ok(lines[0].startsWith("| Topic | AMD (granite3.2:8b) | NVIDIA (qwen/qwen3.5-9b) |"));
   assert.equal(lines[1], "| --- | --- | --- |");
   // Pipes inside cells escaped, newline converted to <br>, topic bolded.
   assert.ok(lines[2].includes("**pipe\\|containing topic**"));
@@ -472,23 +473,20 @@ test("runAnalysisPass: markdown-fenced JSON still parses", async () => {
 // 10. runAnalysisPass — disputes array capped at 5
 // ─────────────────────────────────────────────────────────────────────────
 
-test("runAnalysisPass: disputes array cap enforced at 5", async () => {
+test("runAnalysisPass: disputes array cap enforced at MAX_ANALYSIS_DISPUTES", async () => {
   const mkDispute = (i: number) => ({
     topic: `t${i}`,
     amd_position: `a${i}`,
     nvidia_position: `n${i}`,
   });
+  // Feed two more than the cap so we can assert the cap actually kicked in.
+  const oversizedDisputes = Array.from(
+    { length: MAX_ANALYSIS_DISPUTES + 2 },
+    (_, i) => mkDispute(i + 1)
+  );
   const cannedJson = JSON.stringify({
     agreements: [],
-    disputes: [
-      mkDispute(1),
-      mkDispute(2),
-      mkDispute(3),
-      mkDispute(4),
-      mkDispute(5),
-      mkDispute(6),
-      mkDispute(7),
-    ],
+    disputes: oversizedDisputes,
   });
   const mock = await startMockChatServer(() => ({ content: cannedJson }));
   try {
@@ -503,7 +501,7 @@ test("runAnalysisPass: disputes array cap enforced at 5", async () => {
       model: "mock",
       timeoutMs: 3000,
     });
-    assert.equal(out.disputes.length, 5);
+    assert.equal(out.disputes.length, MAX_ANALYSIS_DISPUTES);
   } finally {
     await mock.close();
   }

@@ -12,7 +12,8 @@
  */
 
 import {
-  LM_STUDIO_URL,
+  WORKER_ENDPOINT,
+  WORKER_API_KEY,
   WORKER_MODEL_NAME,
   CRITIC_TIMEOUT_MS,
   VERBOSE_LOGGING,
@@ -39,6 +40,14 @@ export async function sampleWorker(params: {
   systemPrompt?: string;
 }): Promise<WorkerSample> {
   const start = Date.now();
+  // Default 800: this is a re-sample for the consistency signal, not a
+  // user-facing answer. It runs N times in parallel during /verifydeep
+  // and /verifydeeper, so latency matters more than length. Most
+  // re-samples come back well under 600 tokens; 800 leaves headroom
+  // for the verbose case without dragging the whole signal out. The
+  // worker model's true 8k answer ceiling is not the relevant budget
+  // here — over-budget re-samples would only multiply wall-clock with
+  // diminishing entropy gains, so cap deliberately below it.
   const { question, temperature, maxTokens = 800, systemPrompt } = params;
 
   try {
@@ -50,8 +59,8 @@ export async function sampleWorker(params: {
     messages.push({ role: "user", content: question });
 
     const response = await getLlmClient({
-      endpoint: LM_STUDIO_URL,
-      apiKey: "lm-studio",
+      endpoint: WORKER_ENDPOINT,
+      apiKey: WORKER_API_KEY,
     }).chat.completions.create(
       {
         model: WORKER_MODEL_NAME,

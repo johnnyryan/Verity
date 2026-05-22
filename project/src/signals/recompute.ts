@@ -263,9 +263,19 @@ function parseClaimedNumber(s: string): number | null {
  * Match expressions like `3(5)+7=22`, `2+2 equals 4`, `100 / 4 is 25`.
  * Looks for a sequence of arithmetic-like characters followed by an
  * explicit claim-word then a number.
+ *
+ * 2026-05-12 ReDoS hardening: the `expr` quantifier is now `{2,200}`
+ * instead of the unbounded `{2,}`. The previous bound was applied as
+ * a post-filter (`if (expr.length > 120) continue;`) AFTER the regex
+ * engine had already done potentially-quadratic work on adversarial
+ * input. Capping inside the regex makes the engine bail early on
+ * pathological strings (e.g. long stretches of `123 4 5 6 7 8 ...`
+ * that match the character class but never lead to a claim word).
+ * 200 is comfortably more than any real arithmetic expression a
+ * human or worker LLM would write.
  */
 const ARITHMETIC_RE =
-  /(?<expr>(?:[-+\d\s.,*/^%()]|\*\*){2,})\s*(?:=|⇒|=>|equals?|is\s+equal\s+to|yields)\s*(?<claimed>-?\d+(?:,\d{3})*(?:\.\d+)?)/gi;
+  /(?<expr>(?:[-+\d\s.,*/^%()]|\*\*){2,200})\s*(?:=|⇒|=>|equals?|is\s+equal\s+to|yields)\s*(?<claimed>-?\d+(?:,\d{3})*(?:\.\d+)?)/gi;
 
 interface ArithmeticMatch {
   expr: string;
@@ -276,9 +286,13 @@ interface ArithmeticMatch {
 function detectArithmetic(answer: string): ArithmeticMatch[] {
   const cleaned = stripCodeBlocks(answer);
   const out: ArithmeticMatch[] = [];
-  ARITHMETIC_RE.lastIndex = 0;
+  // 2026-05-12: was `ARITHMETIC_RE.lastIndex = 0` then exec on the
+  // module-level regex. If two runRecomputePass calls interleaved on
+  // the event loop, one's lastIndex reset would corrupt the other's
+  // iteration. Use a per-call regex instance for concurrency safety.
+  const re = new RegExp(ARITHMETIC_RE.source, ARITHMETIC_RE.flags);
   let m: RegExpExecArray | null;
-  while ((m = ARITHMETIC_RE.exec(cleaned)) !== null) {
+  while ((m = re.exec(cleaned)) !== null) {
     const expr = (m.groups?.expr ?? "").trim();
     const claimedRaw = (m.groups?.claimed ?? "").trim();
     if (!expr || !claimedRaw) continue;
@@ -378,7 +392,9 @@ function detectEnumeration(answer: string): EnumerationMatch[] {
   const out: EnumerationMatch[] = [];
 
   // Pattern A: [x*x for x in range(5)] = [0, 1, 4, 9, 16]
-  COMP_RE.lastIndex = 0;
+  // 2026-05-12: removed the COMP_RE.lastIndex = 0 line; matchAll on a
+  // freshly-constructed regex doesn't read or mutate the original's
+  // lastIndex, so the reset was dead code.
   const compMatches = Array.from(cleaned.matchAll(new RegExp(COMP_RE.source, "gi")));
   for (const m of compMatches) {
     const a = Number(m.groups!.a);
@@ -443,6 +459,15 @@ function isLeapYear(y: number): boolean {
 
 // "2024 is a leap year so it has 365 days"  — mismatch (should be 366)
 // "1900 is a leap year"  — mismatch (1900 is NOT leap — century non-divisible-by-400)
+//
+// 2026-05-20 — English-only by design. The phrase "leap year" is the
+// trigger; non-English answers (année bissextile, Schaltjahr, año
+// bisiesto, ...) are deliberately out of scope. The recompute pass is
+// already English-biased throughout (arithmetic detector accepts ASCII
+// digits, enumeration detector matches English words), and extending
+// just this one detector would be misleading without doing the rest.
+// If a future pass adds full multilingual support, extend the
+// "leap year" lexicon here.
 const LEAP_DAYS_RE =
   /(?<year>\b(?:19|20|21)\d{2}\b)[^.]{0,80}?(?:leap\s+year)[^.]{0,80}?(?:has|it\s+has|contains)?\s*(?<days>\d{3})\s*days/gi;
 
@@ -457,9 +482,10 @@ interface LeapMatch {
 function detectLeapYear(answer: string): LeapMatch[] {
   const cleaned = stripCodeBlocks(answer);
   const out: LeapMatch[] = [];
-  LEAP_DAYS_RE.lastIndex = 0;
+  // 2026-05-12: per-call regex instance for concurrency safety.
+  const re = new RegExp(LEAP_DAYS_RE.source, LEAP_DAYS_RE.flags);
   let m: RegExpExecArray | null;
-  while ((m = LEAP_DAYS_RE.exec(cleaned)) !== null) {
+  while ((m = re.exec(cleaned)) !== null) {
     const year = Number(m.groups!.year!);
     const claimedDays = Number(m.groups!.days!);
     const actualIsLeap = isLeapYear(year);
@@ -533,9 +559,10 @@ function detectUnitConstants(answer: string): UnitMatch[] {
   const cleaned = stripCodeBlocks(answer);
   const out: UnitMatch[] = [];
   for (const spec of UNIT_CONSTANTS) {
-    spec.re.lastIndex = 0;
+    // 2026-05-12: per-call regex instance for concurrency safety.
+    const re = new RegExp(spec.re.source, spec.re.flags);
     let m: RegExpExecArray | null;
-    while ((m = spec.re.exec(cleaned)) !== null) {
+    while ((m = re.exec(cleaned)) !== null) {
       const valStr = (m.groups?.value ?? "").replace(/,/g, "");
       const unit = m.groups?.unit ?? "";
       const claimedValue = Number(valStr);
@@ -602,9 +629,10 @@ function detectLinearEquations(
   const source = stripCodeBlocks(question) + "\n" + cleanedA;
 
   const solvedByVar = new Map<string, LinearEqSolution>();
-  LINEAR_EQ_RE.lastIndex = 0;
+  // 2026-05-12: per-call regex instances for concurrency safety.
+  const linRe = new RegExp(LINEAR_EQ_RE.source, LINEAR_EQ_RE.flags);
   let em: RegExpExecArray | null;
-  while ((em = LINEAR_EQ_RE.exec(source)) !== null) {
+  while ((em = linRe.exec(source)) !== null) {
     const sign = em.groups?.coeffSign ?? "";
     const digits = em.groups?.coeffDigits;
     const coefficient = (sign === "-" ? -1 : 1) * (digits ? Number(digits) : 1);
@@ -623,9 +651,9 @@ function detectLinearEquations(
 
   if (solvedByVar.size === 0) return { verifications, mismatches };
 
-  VAR_CLAIM_RE.lastIndex = 0;
+  const varRe = new RegExp(VAR_CLAIM_RE.source, VAR_CLAIM_RE.flags);
   let cm: RegExpExecArray | null;
-  while ((cm = VAR_CLAIM_RE.exec(cleanedA)) !== null) {
+  while ((cm = varRe.exec(cleanedA)) !== null) {
     const variable = (cm.groups?.var ?? "").toLowerCase();
     const eq = solvedByVar.get(variable);
     if (!eq) continue;

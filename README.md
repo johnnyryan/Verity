@@ -1,4 +1,4 @@
-# Verity — Multi-Agent Verification MCP Server
+# Verity (Multi agent verification MCP to minimise hallucinations)
 
 LLMs confidently claim things that are manifestly untrue. Enforce has developed Verity, a tool that helps minimise false claims and fake sources from self-hosted LLMs. It can run on cheap, old hardware. We think it is the first MCP1 that combines cross-family LLM critics, NLI2, deterministic arithmetic recompute,3 consistency sampling,4 perplexity,5 and identifies disputes among these many critics. Today, we are releasing Verity for anyone to use, test, adapt, and improve.
 
@@ -6,14 +6,16 @@ Verity can also produce second opinions. If you have a spare old graphics card V
 
 ---
 
-## Quick start (one-click install)
+## Quick start for local LLM (one-click install)
 
-You need four things on your machine first:
+Verity itself needs only Node.js 18+. Everything else is a choice of where the models run. The one-click install below uses the reference design because it is the least setup, not because it is required: your primary in LM Studio, the critics in Ollama. But any OpenAI-compatible backend can serve in either role, and Verity can run without LM Studio at all. See "Adapt for your hardware" for vLLM, TGI, llama.cpp, cloud providers, and other MCP clients.
 
-1. Node.js 18 or newer
-2. Git
-3. LM Studio 0.3.x or newer, with MCP client support
-4. Ollama (the Vulkan build if you have an AMD card)
+The reference one-click install uses:
+
+1. Node.js 18 or newer, the only hard requirement.
+2. Git, used by the installer to clone the repo. Without it, download the files and run `npm install` then `npm run build` yourself.
+3. LM Studio 0.3.x or newer, as the MCP client and primary LLM host. Claude Desktop or another MCP client also works, or you can skip the client and use the confidence proxy.
+4. Ollama for the two critics (the Vulkan build on AMD).
 
 Then run the installer for your platform.
 
@@ -45,7 +47,7 @@ Open LM Studio. Settings, Model Context Protocol. Paste:
 }
 ```
 
-Load a chat model in LM Studio. That is your worker.
+Load a chat model in LM Studio. 
 
 Then go to **Start** below.
 
@@ -55,14 +57,14 @@ Then go to **Start** below.
 
 Four roles. Each runs as a separate model. Swap any of them.
 
-| Role     | Current model               | Where it runs               |
-|----------|-----------------------------|-----------------------------|
-| Worker   | Qwen 3.5 9B (Q4_K_M)        | Strong GPU, via LM Studio   |
-| Critic A | IBM Granite 3.2 8B (Q4_K_M) | Weak GPU, via Ollama        |
-| Critic B | IBM Granite 3.2 2B (Q4_K_M) | Weak GPU, via Ollama        |
-| NLI      | DeBERTa-v3-large (ONNX)     | CPU                         |
+| Role     | Current model                     | Where it runs               |
+|----------|-----------------------------------|-----------------------------|
+| LLM      | Qwen 3.5 9B (Q4_K_M)              | Strong GPU, via LM Studio   |
+| Critic A | IBM Granite 4.1 8B (Q4_K_M)       | Weak GPU, via Ollama        |
+| Critic B | Ministral 3B, Mistral AI (Q4_K_M) | Weak GPU, via Ollama        |
+| NLI      | DeBERTa-v3-large (ONNX)           | CPU                         |
 
-The names will change. Treat them as placeholders. From here on the document refers to the worker, Critic A, Critic B, and the NLI check, not to any specific model.
+The names will change. Treat them as placeholders. From here on the document refers to your primary LLM as the "worker", Critic A, Critic B, and the NLI check, not to any specific model. Note the spread, though: the worker is from Alibaba, the two critics from IBM and Mistral. Three makers, three sets of blind spots, which is the point rather than the particular models.
 
 ---
 
@@ -117,9 +119,56 @@ One unified memory pool. The installer sets `CONSULT_DUAL=0` for you. The NLI ch
 
 Drop to a one-critic panel. Edit `ALL_CRITICS` in `project/src/critics/critic-configs.ts` to a single entry. Set `MAX_UNAVAILABLE_CRITICS = 0`. You lose cross-critic disputes; the rest still works.
 
-### Knobs that almost always need tuning
+### Cloud model as the worker
 
-| Knob                              | What to tune                                       |
+A standard `/verify` never calls the worker; it reads only the question and the answer text. So with any cloud model you can paste the answer, append `/verify`, and the local critics do the rest, with no setup.
+
+Deep and deeper modes do call the worker, for re-sampling, claim extraction, and regeneration. Point those at the cloud with three settings:
+
+```
+WORKER_ENDPOINT=<base URL>
+WORKER_API_KEY=<your key>
+WORKER_MODEL=<model id>
+```
+
+| Provider | `WORKER_ENDPOINT` | Connects directly | Perplexity (logprobs) |
+|----------|-------------------|-------------------|-----------------------|
+| OpenAI                  | `https://api.openai.com/v1`                                 | Yes | Yes |
+| Microsoft Azure OpenAI  | `https://<resource>.openai.azure.com/openai/v1/`            | Yes | Yes |
+| Google Gemini           | `https://generativelanguage.googleapis.com/v1beta/openai/`  | Yes | No on this surface |
+| Anthropic (Claude)      | `https://api.anthropic.com/v1/`                             | Yes | No |
+| Mistral (La Plateforme) | `https://api.mistral.ai/v1`                                 | Yes | No |
+
+Critics, NLI, recompute, and consistency work with all of these; consistency just re-samples, which any of them can do. Perplexity needs token logprobs, so it works on OpenAI and Azure OpenAI and is skipped with a note on the rest: Anthropic ignores the request and returns nothing, Gemini exposes logprobs only on its native API rather than the OpenAI surface above, and Mistral has no logprob parameter. For Azure, `WORKER_MODEL` is your deployment name, not the catalogue id. If a provider's auth does not fit a plain `Authorization: Bearer` header, or it has no OpenAI-compatible surface, put a gateway such as LiteLLM in front and point `WORKER_ENDPOINT` at that.
+
+Two things to weigh. Cost: deeper re-samples the worker five times, so one check is five cloud generations. Privacy: a standard check keeps the answer on the machine, but deep and deeper send the question and the answer to the provider. Keep the worker local if either matters.
+
+### Where logprobs come from
+
+Two signals use token logprobs: the perplexity check, and the proxy below. Whether they are available depends on the model server, not on Verity. For local backends:
+
+| Backend | Logprobs | What Verity gets |
+|---------|----------|------------------|
+| LM Studio                | Responses API only (`/v1/responses`)                  | Scores a re-answer; proxy works |
+| llama.cpp `llama-server` | `logprobs` on chat, `n_probs` on `/completion`        | Scores the answer, roughly |
+| vLLM                     | `logprobs` plus `prompt_logprobs` / `echo`            | Scores the exact answer under review |
+| Hugging Face TGI         | `decoder_input_details`                               | Scores the exact answer under review |
+| Ollama                   | native `/api/generate` only; the OpenAI path drops them | No proxy; perplexity only via the native API |
+| Jan                      | not surfaced                                          | Nothing |
+
+The split that matters: vLLM and TGI can score the answer a user already has; LM Studio can only score text it generates itself, so its perplexity is a re-answer, exact on a deterministic question and a near-twin otherwise. Point Verity at vLLM or TGI if you want the answer under review scored directly.
+
+### Confidence on every answer (the proxy)
+
+In a sealed chat window (the LM Studio app, `ollama run`) Verity cannot see an answer's tokens, so it can only score confidence when you run a deep verify. Chat through an external client and the proxy removes that limit.
+
+Point Open Web UI, Jan, LibreChat, or AnythingLLM at the proxy (`http://localhost:1235/v1`) instead of at the backend, and start it with `npm run proxy`. A plain answer then arrives with a confidence note whenever the model was unsure; tool calls, structured output, images, and everything else pass through untouched. The per-request rules and client setup are in `docs/confidence-proxy.md`.
+
+The proxy needs a backend that serves logprobs from a responses-style endpoint: LM Studio does, Ollama does not (see the table above).
+
+### Settings that almost always need tuning
+
+| setting                              | What to tune                                       |
 |-----------------------------------|----------------------------------------------------|
 | `WORKER_MODEL_NAME`               | Match whatever you run in LM Studio                |
 | `CRITIC_A_MODEL`, `CRITIC_B_MODEL`| Whatever fits the weak GPU                         |
@@ -145,8 +194,8 @@ Type any of these after a worker reply.
 | Command         | What runs                                                   | Time   |
 |-----------------|-------------------------------------------------------------|--------|
 | `/verify`       | Two critics, NLI claim check, recompute                     | 3-5 s  |
-| `/verifydeep`   | Standard, plus 2-sample consistency and perplexity rescore  | ~20 s  |
-| `/verifydeeper` | Standard, plus 5-sample consistency and perplexity (regen)  | ~40 s  |
+| `/verifydeep`   | Standard, plus 2-sample consistency, advisory uncertainty   | ~20 s  |
+| `/verifydeeper` | Standard, plus 5-sample consistency, advisory uncertainty   | ~40 s  |
 
 ### Context
 
@@ -184,11 +233,11 @@ Five checks, fired in parallel.
 2. **NLI claim check.** Each factual claim is paired with the prior context. A 0.4 B encoder transformer (not an LLM) labels each pair as entailment, contradiction, or neutral. Runs on CPU.
 3. **Recompute pass.** Pure code. Pulls arithmetic and unit conversions out of the answer, evaluates them, flags mismatches. 100% precision when it fires.
 4. **Consistency** (deep modes only). Re-asks the worker N times at temperature 0.7. Compares each re-sample against the original.
-5. **Perplexity** (deep modes only). Scores the answer's tokens. Flags low-confidence spans.
+5. **Perplexity** (deep modes only, advisory). Reads the worker's own token probabilities and flags low-confidence spans as model uncertainty. A nudge, not a vote: it never moves the verdict on its own, and it cannot catch a confident, fluent error. The consistency check guards against that.
 
 Each check has a different failure profile. That is the point. Two LLMs from similar training data tend to be wrong about the same things; when they agree, they often agree wrong. The NLI classifier was trained on entailment labels, not helpfulness preferences. The recompute pass has no bias profile at all because it is not statistical. When two layers built on different machinery agree on a flaw, the signal is strong.
 
-The aggregator combines all five into one of: pass, warn, fail, error.
+The aggregator combines the first four into one of: pass, warn, fail, error. Perplexity rides alongside as an advisory note and never changes the verdict.
 
 A separate disputes table is computed after the verdict. It surfaces concerns one critic raised but not the other. The user sees disagreement even when the headline verdict is pass.
 
@@ -203,11 +252,11 @@ VRAM use, current line-up:
 | Role     | Size  | VRAM    | Device                          |
 |----------|-------|---------|---------------------------------|
 | Worker   | 9 B   | ~5.5 GB | Strong GPU, LM Studio           |
-| Critic A | 8 B   | ~4 GB   | Weak GPU, Ollama                |
-| Critic B | 2 B   | ~1.8 GB | Weak GPU, Ollama                |
+| Critic A | 8 B   | ~5.3 GB | Weak GPU, Ollama                |
+| Critic B | 3 B   | ~2.5 GB | Weak GPU, Ollama                |
 | NLI      | 0.4 B | ~1 GB   | CPU (ONNX Runtime)              |
 
-The strong GPU uses about a third of its memory; the weak GPU about three quarters. Plenty of headroom for KV cache.
+The strong GPU uses about a third of its memory. The two critics now fill most of the weak card, roughly 8 GB of models on an 8 GB card, so KV-cache headroom is slim. Drop Critic A to a q3 quant if Ollama starts evicting.
 
 Verity wants two things from the critics: different training data than the worker, and small enough to share the weak GPU. Family diversity matters more than size. Two small critics from different vendors catch more than one large critic that shares the worker's training family.
 
@@ -235,12 +284,14 @@ verity/
 │   └── ollama-amd.ps1            (AMD-pinning helper for Ollama)
 └── project/
     ├── src/
-    │   ├── config.ts             (every [ADAPT] knob lives here)
+    │   ├── config.ts             (every [ADAPT] setting lives here)
     │   ├── index.ts              (MCP entry point)
     │   ├── aggregator.ts         (verdict logic)
     │   ├── critics/              (critic configs, prompts)
     │   ├── nli/                  (DeBERTa wrapper)
-    │   └── second-opinion/       (the /second tool)
+    │   ├── signals/              (recompute, consistency, perplexity, confidence)
+    │   ├── second-opinion/       (the /second tool)
+    │   └── proxy/                (optional confidence proxy for external clients)
     ├── package.json
     └── README.md                 (original v1 README; this file is v2)
 ```

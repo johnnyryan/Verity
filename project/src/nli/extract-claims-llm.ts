@@ -22,7 +22,8 @@ import OpenAI from "openai";
 
 import {
   CRITIC_TIMEOUT_MS,
-  LM_STUDIO_URL,
+  WORKER_ENDPOINT,
+  WORKER_API_KEY,
   NLI_MAX_CLAIMS,
   VERBOSE_LOGGING,
   WORKER_MODEL_NAME,
@@ -60,13 +61,17 @@ Return at most ${NLI_MAX_CLAIMS} of the most important claims.`;
  */
 export async function extractClaimsLLM(answer: string): Promise<string[] | null> {
   const start = Date.now();
+  // 2026-05-12 (E2): timer + abort moved outside the try so the
+  // finally can always clear it. Previously the clearTimeout was
+  // inside the try, unreachable on any throw, leaving an orphan
+  // setTimeout that fired on a dead AbortController and kept the
+  // Node event loop alive.
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), CRITIC_TIMEOUT_MS);
   try {
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), CRITIC_TIMEOUT_MS);
-
     const response = await getLlmClient({
-      endpoint: LM_STUDIO_URL,
-      apiKey: "lm-studio",
+      endpoint: WORKER_ENDPOINT,
+      apiKey: WORKER_API_KEY,
     }).chat.completions.create(
       {
         model: WORKER_MODEL_NAME,
@@ -88,8 +93,6 @@ export async function extractClaimsLLM(answer: string): Promise<string[] | null>
       { signal: abort.signal }
     );
 
-    clearTimeout(timer);
-
     const raw = response.choices[0]?.message?.content ?? "";
     if (VERBOSE_LOGGING) {
       console.error(
@@ -101,6 +104,8 @@ export async function extractClaimsLLM(answer: string): Promise<string[] | null>
   } catch (err) {
     if (VERBOSE_LOGGING) console.error("[extract-claims-llm] error:", err);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -118,8 +118,11 @@ test("truncates oversize concern strings with ellipsis", () => {
   const out = parseCriticJson(raw);
   assert.ok(out);
   assert.equal(out.concerns.length, 1);
-  // 2_000 + the trailing ellipsis character.
-  assert.equal(out.concerns[0].length, 2_001);
+  // Truncated to <= 2_000 chars + the trailing ellipsis character.
+  // `<=` rather than `==` so a tweak to the truncation budget (e.g. trim
+  // trailing whitespace before appending ellipsis) doesn't break the test
+  // on what is fundamentally a "didn't blow past the cap" assertion.
+  assert.ok(out.concerns[0].length <= 2_001);
   assert.ok(out.concerns[0].endsWith("…"));
 });
 

@@ -22,15 +22,24 @@
  */
 
 import {
-  LM_STUDIO_URL,
+  WORKER_ENDPOINT,
+  WORKER_API_KEY,
   WORKER_MODEL_NAME,
   PERPLEXITY_LOW_CONFIDENCE_LOGPROB,
   PERPLEXITY_MAX_FLAGGED_SPANS,
+  PERPLEXITY_RESPONSES_TOP_LOGPROBS,
+  PERPLEXITY_REGEN_MAX_TOKENS,
   CRITIC_TIMEOUT_MS,
   VERBOSE_LOGGING,
 } from "../config.js";
 import { getLlmClient } from "../llm/client.js";
 import type { PerplexityResult } from "../types.js";
+import {
+  computeConfidence,
+  classifyConfidence,
+  renderConfidenceNote,
+  type TokenLogprob,
+} from "./confidence.js";
 
 /**
  * Try to score the existing answer via /v1/completions with echo=true.
@@ -61,8 +70,8 @@ async function tryForwardPassRescore(
 
     // The OpenAI SDK exposes legacy completions on `client.completions.create`.
     const response: any = await getLlmClient({
-      endpoint: LM_STUDIO_URL,
-      apiKey: "lm-studio",
+      endpoint: WORKER_ENDPOINT,
+      apiKey: WORKER_API_KEY,
     }).completions.create(
       {
         model: WORKER_MODEL_NAME,
@@ -130,8 +139,8 @@ async function regenerateWithLogprobs(
 
     // Chat completions support logprobs in newer OpenAI SDK / LM Studio versions.
     const response: any = await getLlmClient({
-      endpoint: LM_STUDIO_URL,
-      apiKey: "lm-studio",
+      endpoint: WORKER_ENDPOINT,
+      apiKey: WORKER_API_KEY,
     }).chat.completions.create(
       {
         model: WORKER_MODEL_NAME,
@@ -167,6 +176,84 @@ async function regenerateWithLogprobs(
   } catch (err) {
     if (VERBOSE_LOGGING) {
       console.error("[perplexity] regenerate failed:", err);
+    }
+    return null;
+  }
+}
+
+/**
+ * Method A: regenerate via /v1/responses and capture per-token logprobs.
+ *
+ * This is the ONLY logprobs path that actually works on LM Studio (0.3.x+).
+ * /v1/chat/completions and /v1/completions both return logprobs:null there
+ * by design (see design doc + lmstudio-ai/lms#60); the OpenAI Responses API
+ * surfaces them via `include: ["message.output_text.logprobs"]`. Verified
+ * 2026-05-22 on both GGUF and MLX gemma builds. Like method C this scores a
+ * FRESH generation, not the answer under review.
+ *
+ * Uses fetch() rather than the OpenAI SDK because older SDK builds don't
+ * type the Responses API's `include` / `top_logprobs` fields.
+ */
+async function tryResponsesLogprobs(
+  question: string
+): Promise<PerplexityResult | null> {
+  const start = Date.now();
+
+  try {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), CRITIC_TIMEOUT_MS);
+
+    const res = await fetch(`${WORKER_ENDPOINT}/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        // LM Studio ignores the key; a cloud worker (OpenAI) needs it.
+        Authorization: `Bearer ${WORKER_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: WORKER_MODEL_NAME,
+        input: question,
+        include: ["message.output_text.logprobs"],
+        top_logprobs: PERPLEXITY_RESPONSES_TOP_LOGPROBS,
+        max_output_tokens: PERPLEXITY_REGEN_MAX_TOKENS,
+        temperature: 0,
+      }),
+      signal: abort.signal,
+    });
+
+    clearTimeout(timer);
+    if (!res.ok) return null;
+
+    const data: any = await res.json();
+
+    // Walk output[] → content[] → logprobs[]. Each entry is
+    // { token, logprob, bytes, top_logprobs[] }.
+    const tokens: string[] = [];
+    const tokenLogprobs: (number | null)[] = [];
+    for (const item of data?.output ?? []) {
+      for (const c of item?.content ?? []) {
+        const lps = c?.logprobs;
+        if (!Array.isArray(lps)) continue;
+        for (const t of lps) {
+          tokens.push(typeof t?.token === "string" ? t.token : "");
+          tokenLogprobs.push(
+            typeof t?.logprob === "number" ? t.logprob : null
+          );
+        }
+      }
+    }
+
+    if (!tokens.length) return null;
+
+    return computeStats({
+      tokens,
+      tokenLogprobs,
+      method: "responses_logprobs",
+      start,
+    });
+  } catch (err) {
+    if (VERBOSE_LOGGING) {
+      console.error("[perplexity] /v1/responses logprobs failed:", err);
     }
     return null;
   }
@@ -241,6 +328,16 @@ function computeStats(params: {
     flagged.push({ text: runTokens.join(""), min_logprob: runMin });
   }
 
+  // Derive the confidence band + escalation recommendation from the same
+  // per-token logprobs. Shared classifier so the perplexity row and any
+  // generation-confidence gate speak with one voice.
+  const confidence = classifyConfidence(
+    computeConfidence(
+      valid.map<TokenLogprob>((v) => ({ token: v.tok, logprob: v.lp }))
+    )
+  );
+  const confidenceNote = renderConfidenceNote(confidence);
+
   return {
     ran: true,
     method,
@@ -248,11 +345,13 @@ function computeStats(params: {
     mean_logprob: Number(meanLogprob.toFixed(3)),
     perplexity: Number(perplexity.toFixed(3)),
     low_confidence_spans: flagged,
+    confidence,
     latency_ms: Date.now() - start,
     notes:
       `Mean token logprob ${meanLogprob.toFixed(2)} → perplexity ` +
       `${perplexity.toFixed(2)}. ${flagged.length} low-confidence span(s) ` +
-      `(threshold: logprob <= ${PERPLEXITY_LOW_CONFIDENCE_LOGPROB}).`,
+      `(threshold: logprob <= ${PERPLEXITY_LOW_CONFIDENCE_LOGPROB}).` +
+      (confidenceNote ? ` ${confidenceNote}` : ""),
   };
 }
 
@@ -270,7 +369,10 @@ export async function runPerplexityCheck(params: {
 }): Promise<PerplexityResult> {
   const start = Date.now();
 
-  // Method B: forward-pass rescore (fast, ~1–2s)
+  // Method B: forward-pass rescore of the ACTUAL answer (fast, ~1–2s).
+  // Works only against an echo-capable /v1/completions (a llama-server
+  // side-car); LM Studio returns null here. Tried first because, when
+  // available, it scores the real answer rather than a regeneration.
   const methodB = await tryForwardPassRescore(params.question, params.answer);
   if (methodB && methodB.ran) return methodB;
 
@@ -284,25 +386,32 @@ export async function runPerplexityCheck(params: {
       low_confidence_spans: [],
       latency_ms: Date.now() - start,
       notes:
-        "Forward-pass rescore unavailable on this LM Studio setup. " +
-        "Use /verifydeeper to enable regeneration fallback (~8s).",
+        "Forward-pass rescore of the original answer needs an echo-capable " +
+        "endpoint (llama-server side-car); LM Studio does not expose it. " +
+        "Use /verifydeeper to enable /v1/responses regeneration (~8s).",
     };
   }
 
-  // Method C: regenerate with logprobs (deeper mode only)
+  // Method A: regenerate via /v1/responses (deeper mode). The working
+  // logprobs path on LM Studio.
+  const methodA = await tryResponsesLogprobs(params.question);
+  if (methodA && methodA.ran) return methodA;
+
+  // Method C: legacy /v1/chat/completions logprobs. Dead on LM Studio
+  // (returns null) but kept for non-LM-Studio hosts that honour it.
   const methodC = await regenerateWithLogprobs(params.question);
   if (methodC && methodC.ran) return methodC;
 
   return {
     ran: false,
-    method: "regenerate_with_logprobs",
+    method: "responses_logprobs",
     tokens_scored: 0,
     mean_logprob: 0,
     perplexity: 0,
     low_confidence_spans: [],
     latency_ms: Date.now() - start,
     notes:
-      "Both forward-pass rescore and regeneration with logprobs failed. " +
-      "LM Studio may not expose logprobs for this worker model.",
+      "No logprobs returned by /v1/responses, /v1/chat/completions, or the " +
+      "forward-pass rescore. The worker host may not expose logprobs.",
   };
 }

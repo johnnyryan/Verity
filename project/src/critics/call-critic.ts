@@ -155,10 +155,14 @@ export async function callCritic(
     }
   }
 
+  // 2026-05-12 (E2): timer + abort moved outside the try so the
+  // finally can always clear it. Previously the clearTimeout was at
+  // line 179 inside the try, unreachable on any throw. The orphan
+  // setTimeout then fired on a dead AbortController and kept the
+  // Node event loop alive past process intent.
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), CRITIC_TIMEOUT_MS);
   try {
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), CRITIC_TIMEOUT_MS);
-
     const response = await getLlmClient({
       endpoint: cfg.endpoint,
       apiKey: cfg.apiKey,
@@ -175,8 +179,6 @@ export async function callCritic(
       },
       { signal: abort.signal }
     );
-
-    clearTimeout(timer);
 
     const raw = response.choices[0]?.message?.content ?? "";
     if (VERBOSE_LOGGING) {
@@ -227,5 +229,7 @@ export async function callCritic(
       error: err instanceof Error ? err.message : String(err),
       latency_ms: Date.now() - start,
     };
+  } finally {
+    clearTimeout(timer);
   }
 }

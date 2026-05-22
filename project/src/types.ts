@@ -21,7 +21,7 @@ export type VerifyMode = "standard" | "deep" | "deeper";
  * Critics are instructed to return JSON matching this shape.
  */
 export interface CriticResult {
-  /** Stable identifier for the critic (e.g. "granite_3_2_8b"). */
+  /** Stable identifier for the critic (e.g. "critic_a"). */
   id: string;
   /** Human-readable display name. */
   display_name: string;
@@ -131,6 +131,50 @@ export interface RecomputeResult {
 }
 
 /**
+ * Confidence band derived from a generation's per-token logprobs.
+ *   ok       → nothing to flag
+ *   mild     → recommend a standard /verify
+ *   low      → recommend /verifydeep
+ *   very_low → recommend /verifydeeper
+ */
+export type ConfidenceBand = "ok" | "mild" | "low" | "very_low";
+
+/**
+ * Raw confidence statistics computed from a token-logprob stream. Both a
+ * global axis (mean/perplexity, low-confidence token ratio) and a local
+ * axis (the single weakest token) so a lone hallucinated name/number is
+ * caught even when the answer is otherwise fluent.
+ */
+export interface ConfidenceMetrics {
+  tokens_scored: number;
+  /** Mean per-token logprob. */
+  mean_logprob: number;
+  /** exp(-mean_logprob). Higher = more uncertain. */
+  perplexity: number;
+  /** Weakest single-token logprob in the stream (global minimum). */
+  min_logprob: number;
+  /** Text of the weakest token. */
+  min_logprob_token: string;
+  /** Count of tokens at or below PERPLEXITY_LOW_CONFIDENCE_LOGPROB. */
+  low_confidence_tokens: number;
+  /** low_confidence_tokens / tokens_scored, in [0,1]. */
+  low_confidence_ratio: number;
+}
+
+/**
+ * The output of the confidence classifier (src/signals/confidence.ts).
+ * Used both by the perplexity signal and by the generation-confidence gate.
+ */
+export interface ConfidenceAssessment {
+  band: ConfidenceBand;
+  /** Verify depth to escalate to, or null when the answer is confident. */
+  recommended_mode: VerifyMode | null;
+  /** One-line, human-readable reason the band fired. */
+  reason: string;
+  metrics: ConfidenceMetrics;
+}
+
+/**
  * Result of the logprob-based perplexity / token-entropy check.
  * Only present when mode is "deep" or "deeper".
  */
@@ -138,10 +182,19 @@ export interface PerplexityResult {
   ran: boolean;
   /**
    * Which method actually produced the result:
-   *   forward_pass_rescore — fast, ~1–2 s, requires LM Studio /v1/completions support
-   *   regenerate_with_logprobs — fallback, ~8 s, only used in "deeper" mode
+   *   forward_pass_rescore — fast, ~1–2 s, scores the ACTUAL answer; needs an
+   *     echo-capable /v1/completions (a llama-server side-car — LM Studio
+   *     returns null here, see design doc).
+   *   responses_logprobs — regenerates via /v1/responses and scores the fresh
+   *     answer. The working logprobs path on LM Studio (0.3.x+, both GGUF and
+   *     MLX). Used in "deeper" mode. Cost: ~8 s.
+   *   regenerate_with_logprobs — legacy /v1/chat/completions fallback; LM
+   *     Studio returns null logprobs here, kept only for non-LM-Studio hosts.
    */
-  method: "forward_pass_rescore" | "regenerate_with_logprobs";
+  method:
+    | "forward_pass_rescore"
+    | "responses_logprobs"
+    | "regenerate_with_logprobs";
   tokens_scored: number;
   /** Mean per-token logprob across the answer. */
   mean_logprob: number;
@@ -152,6 +205,11 @@ export interface PerplexityResult {
     text: string;
     min_logprob: number;
   }>;
+  /**
+   * Confidence band + escalation recommendation derived from the per-token
+   * logprobs. Present only when the check ran with usable logprobs.
+   */
+  confidence?: ConfidenceAssessment;
   latency_ms: number;
   notes: string;
 }
@@ -193,13 +251,18 @@ export interface VerifyInput {
  * Final output returned by the pipeline.
  */
 export interface VerifyOutput {
-  critics: {
-    // [ADAPT] These keys track the ids in critic-configs.ts. Swap a critic
-    // by renaming the key here + updating pipeline.ts findCritic() calls.
-    granite_3_2_8b: CriticResult;
-    granite_3_2_2b: CriticResult;
-    // llama32_3b: CriticResult;  // re-add if Critic C is re-enabled
-  };
+  /**
+   * Keyed by critic id (the `id` field of each CriticConfig in
+   * critic-configs.ts). The set of keys at runtime matches ALL_CRITICS;
+   * swap or add critics there and the output shape adapts automatically.
+   *
+   * 2026-05-12: was a literal object type listing each critic id
+   * statically. That forced three files to be touched in lockstep
+   * (critic-configs.ts, types.ts, pipeline.ts) every time the panel
+   * changed. Now a generic Record so adding a critic is a one-file
+   * change.
+   */
+  critics: Record<string, CriticResult>;
   /**
    * Diagnostic-only record of disagreements between the two critics.
    * Always present; empty array when the critics agree (or when too few
@@ -219,9 +282,10 @@ export interface VerifyOutput {
    * 2026-04-21 additive: a pre-rendered human-readable Markdown block the
    * worker can paste verbatim into chat. Contains the consensus verdict,
    * a critic-by-critic table keyed on display_name (so the user sees
-   * "IBM Granite 3.2 8B" rather than the stable wire id "granite_3_2_8b"),
-   * recompute / NLI / disputes tallies, and a collapsed <details> wrapper
-   * around the raw JSON payload for developers who still want it.
+   * the running model's display label rather than the stable wire id
+   * "critic_a"), recompute / NLI / disputes tallies, and a collapsed
+   * <details> wrapper around the raw JSON payload for developers who
+   * still want it.
    *
    * The worker tool description (src/index.ts) instructs the LLM to render
    * this field AS-IS. The rest of VerifyOutput is unchanged — summary_md

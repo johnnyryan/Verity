@@ -1,30 +1,29 @@
-# Verity — Design
+# Verity Design
 
-LLMs claim untrue things with confidence. Verity catches them. It runs locally on cheap, old hardware. This document explains how it is built and why.
+LLMs claim untrue things with confidence. Verity is intended to catch these hallucinations. It runs locally on cheap, old hardware, and it can work with cloud AI. This document explains how it is built and why.
 
 The README (`project/readmev.md`) covers install and daily use. This document covers the design and the lessons that shaped it.
 
 ## Current line-up
 
-Four roles. The names below are the current pick; treat them as placeholders. The rest of this document refers to the worker, Critic A, Critic B, and the NLI check.
+Four roles. The names below are the current pick; treat them as placeholders. The rest of this document refers to the worker, Critic A, Critic B, and the NLI check. The "worker" is your primary LLM, the AI you ask questions. 
 
-| Role     | Current model               | Where it runs              |
-|----------|-----------------------------|----------------------------|
-| Worker   | Qwen 3.5 9B (Q4_K_M)        | Strong GPU, via LM Studio  |
-| Critic A | IBM Granite 3.2 8B (Q4_K_M) | Weak GPU, via Ollama       |
-| Critic B | IBM Granite 3.2 2B (Q4_K_M) | Weak GPU, via Ollama       |
-| NLI      | DeBERTa-v3-large (ONNX)     | CPU                        |
+| Role     | Current model                     | Where it runs              |
+|----------|-----------------------------------|----------------------------|
+| Worker   | Qwen 3.5 9B (Q4_K_M)              | Strong GPU, via LM Studio  |
+| Critic A | IBM Granite 4.1 8B (Q4_K_M)       | Weak GPU, via Ollama       |
+| Critic B | Ministral 3B, Mistral AI (Q4_K_M) | Weak GPU, via Ollama       |
+| NLI      | DeBERTa-v3-large (ONNX)           | CPU                        |
 
 ---
 
 ## 1. Goals
 
-1. Catch confident wrong claims from a local LLM.
+1. Catch confident wrong claims from a local LLM. (Works with cloud, too)
 2. Use cheap, old hardware. Run everything locally.
 3. Pick critics from different training families so their blind spots do not overlap.
-4. Keep all four models resident. No swapping during use.
-5. Fail soft. One critic timing out should not kill the verdict.
-6. Stay simple. One JSON tool. One MCP server. One config file.
+4. Keep all four models resident so there is no swapping during use slowing things down. 
+5. One critic timing out should not kill the verdict.
 
 ---
 
@@ -61,7 +60,7 @@ Largest critic. Catches subtle code bugs, off-by-ones, missing null checks, cita
 
 ### Critic B (fast)
 
-Smaller, same vendor as Critic A, distinct training corpus. Quick second voice. Weight = 1.
+Smaller, and from a different vendor than Critic A: Mistral, where A is IBM. The two critics no longer share a training family. Quick second voice. Weight = 1.
 
 ### NLI check (not an LLM)
 
@@ -69,7 +68,7 @@ A 0.4 B encoder transformer. Takes a sentence pair and outputs three numbers: en
 
 ### Family diversity, in plain terms
 
-If both critics share the worker's training data, they all share the same blind spots. Two cross-family models trained on different corpora catch errors a single larger model would miss. The current panel uses one vendor for both critics; the cross-family axis is thinner than v1 (see Appendix A.3). Re-introducing a second vendor when VRAM allows is on the deferred list.
+If both critics share the worker's training data, they all share the same blind spots. Two cross-family models trained on different corpora catch errors a single larger model would miss. The current panel spans three vendors: Alibaba for the worker, IBM for Critic A, Mistral for Critic B. That restores the cross-family axis an all-IBM critic pair had thinned (see Appendix A.3 and the 2026-05-12 critic swap in the change log).
 
 ---
 
@@ -129,7 +128,7 @@ Deep mode adds 2-sample consistency and a perplexity rescore. Deeper mode raises
 
 ## 5. Context handling
 
-The worker runs at high context. Critics do not need that much. More context adds distractors, not signal (Chen et al., 2024). Three modes manage how much goes through.
+Three modes manage how much context is given to critics.
 
 - **Minimal** (default). Question and answer only. 2-8 k tokens. Best for code review, maths, and self-contained prose.
 - **With context**. Worker passes the earlier messages the answer depends on (documents, specifications, data, constraints). Aim for under 24 k tokens.
@@ -167,31 +166,31 @@ Published version: SelfCheckGPT (Manakul et al., 2023). Hallucinations tend to f
 
 Catches low-confidence guessing. Does not catch consistent overconfidence.
 
-### Perplexity (deep modes only)
+### Perplexity (deep modes only, advisory)
 
-Score the answer's tokens. Tokens with low log-probability flag spans the worker was hesitant about; those are often where hallucinations hide.
+Read the worker's own token probabilities. Low-probability spans mark where the worker was hesitant. Reported as model uncertainty, and advisory only: it never moves the verdict (see § 7), because token confidence is blind to a confident, fluent hallucination and runs high on rare-but-correct wording. The consistency check is the real guard against confident error; this is a nudge to look closer.
 
-Two strategies, tried in order:
+Where the numbers come from. LM Studio exposes logprobs on one endpoint only, its responses API; the chat-completions and completions endpoints return null. So:
 
-1. Forward-pass rescore. Fast (1-2 s). Works only if the worker model supports completion-style scoring.
-2. Regenerate with logprobs enabled (deeper mode only). About 8 s. The new answer may differ from the user's original, but the uncertainty signal is still meaningful.
+1. Forward-pass rescore of the exact answer. Fast (1-2 s), but needs an echo-capable endpoint, such as a llama.cpp side-car, vLLM, or TGI. LM Studio cannot do it.
+2. Regenerate through the responses endpoint (deeper mode). The logprobs are exact for the regenerated text, which matches the original on a deterministic answer and is a near-twin otherwise.
 
-If both fail, the signal is skipped with a note. The pipeline degrades gracefully.
+If neither is available, the signal is skipped with a note. The pipeline degrades gracefully.
 
 ---
 
 ## 7. Aggregator
-
-Fixed rules. No machine learning. The aggregator is the only place verdicts are decided.
 
 ```
 recompute mismatch:                                     fail
 any critic.severity >= 3, or NLI contradicts:            fail
 consistency divergence >= 0.5 (deep modes only):         fail
 any critic.severity >= 2, or NLI unsupported (>= 2):     warn
-consistency divergence >= 0.15, or perplexity flagged:   warn
+consistency divergence >= 0.15 (deep modes only):        warn
 otherwise:                                                pass
 ```
+
+Perplexity is deliberately absent from these rules. Since 2026-05-22 it is an advisory note only.
 
 Recompute suppression: a verified arithmetic expression cancels any NLI contradiction whose claim contains that expression.
 
@@ -249,7 +248,7 @@ Set `CONSULT_DUAL=0` on smaller hardware to disable the dual-GPU path.
 
 ## 9. System prompt for the worker
 
-Verity ships with a recommended system prompt. The full text is in `project/readmev2.md`. Key clauses:
+Verity ships with a recommended system prompt. The full text is in `docs/system-prompt.md`. Key clauses:
 
 - Treat `/verify` and `/second` as tool triggers, not English words.
 - Source non-trivial claims with a working URL fetched first via the fetch tool. The required citation format is `[N], [author], [publisher], [year], [page], [url]`.
@@ -264,7 +263,7 @@ The prompt also covers the empty case (blank system prompt). The tool descriptio
 ## 10. Known limits
 
 - **Vulkan on Windows for the RDNA1 card is second-class.** Driver hiccups happen. The pipeline degrades gracefully: a critic that times out is marked unavailable; the surviving critic still votes. Consensus is "error" only when more than `MAX_UNAVAILABLE_CRITICS` critics fall over.
-- **Family diversity is thinner than v1.** The current panel uses one vendor for both critics. A second vendor when hardware allows would close the gap.
+- **Convergent failure.** Even cross-family critics can share a mistake when the same wrong fact sits in all their training data. The three-vendor panel reduces this; it does not eliminate it.
 - **Claim extraction is heuristic in standard mode.** Sentence splitting plus filters for numbers, dates, and named entities. The deep-mode LLM extractor is much better.
 - **NLI needs a premise.** Without prior context the check is effectively skipped. The pairwise fallback (claim against claim within one answer) tested as zero signal and is off by default.
 - **Consistency catches uncertainty, not confident error.** Re-sampling the same model just gives N samples from the same distribution.
@@ -276,10 +275,17 @@ The prompt also covers the empty case (blank system prompt). The tool descriptio
 ## 11. Deferred
 
 - **Debate rounds.** Critics see one another's verdicts and respond. Catches more, at about twice the latency.
-- **Hybrid cloud option.** A Groq, Gemini, or Claude call as an extra critic would expand family diversity without local hardware cost. Trade-off: data leaves the device.
-- **A non-IBM critic.** Replace one of the current critics with a Phi-4 or similar at the same memory budget. Restores the cross-family axis.
 - **Bi-encoder NLI pre-filter.** Cheap shortlister for long answers; cross-encoder runs only on the survivors. Cuts NLI cost on long answers in half. Not yet measured.
-- **Try new models.** V
+
+---
+
+## 12. Confidence proxy and cloud workers (optional)
+
+Two optional ways to run Verity, both added 2026-05-22. Neither is needed for `/verify`.
+
+**Cloud worker.** A standard `/verify` reads only the question and the answer text; it never calls the worker. So the worker can be a cloud model with no change. Deep and deeper modes do call the worker, for re-sampling, claim extraction, and regeneration; `WORKER_ENDPOINT` and `WORKER_API_KEY` point those at any OpenAI-compatible endpoint. The cost is per-token billing and the answer leaving the machine. Keep the worker local if that matters.
+
+**Confidence proxy.** A built-in chat window cannot be intercepted, and once an answer is generated through it the per-token probabilities are gone, so Verity cannot force a confidence check on every answer there. An external client can: point Open Web UI, Jan, LibreChat, or AnythingLLM at `project/src/proxy/` instead of the backend, and every answer it produces carries a confidence note. The proxy forwards everything byte-for-byte except a fully serviceable plain-text request, which it routes once through the responses endpoint for exact, free logprobs. Anything with tools, structured output, images, or multiple completions passes through untouched and ungraded. This is forced by the API. On LM Studio you cannot have both zero loss of functionality and logprobs on every answer, because logprobs live only on the responses endpoint, which has a smaller feature surface than chat-completions. So the proxy scores the plain-text case and leaves the rest alone.
 
 ---
 
@@ -398,6 +404,8 @@ Through 2026-05-11 the JSON output used `phi4_reasoning` and `nemotron_mini` as 
 
 Fix on 2026-05-11: renamed to `granite_3_2_8b` and `granite_3_2_2b`. The tool description also has an explicit "do not invent these names" guardrail to catch any remaining training-data leakage.
 
+**2026-05-20 follow-up:** the wire ids were generalised again to `critic_a` / `critic_b`. Pinning the slot name to a specific model meant every model swap (e.g. the 2026-05-20 04:50 swap to `granite4.1:8b` + `ministral-3:3b`) left the wire id lagging. The model-agnostic names follow the convention already established by `CRITIC_A_MODEL` / `CRITIC_B_MODEL` env vars and `displayName: "Critic A" / "Critic B"`, so a future swap is now a one-file change in `critic-configs.ts`.
+
 ## A.14  LM Studio MCP plugin handshake race
 
 **Symptom.** The first chat sent after restarting LM Studio gets a prose-only answer; `verify_answer` is not called. The second chat onwards calls the tool. Reproducible: 100% of restarts, identical input.
@@ -446,3 +454,120 @@ Fix on 2026-05-12: renamed to `verify_answer`. The tool description now explicit
 The worker sometimes passes a composed answer to `verify_answer` but never emits that prose in a visible assistant message. The user sees a stack of tool-call accordions (search, fetch, verify) followed by the verdict block, with no answer in between.
 
 Fix on 2026-05-12: the rendered Markdown block now echoes the answer at the top, under an `## Answer` heading, followed by the verdict table. The block is what the worker pastes; the answer is visible in chat regardless of where the worker put it during composition.
+
+---
+
+## Change log
+
+Append-only record of substantive changes to Verity (code, scripts, and this design doc). Most recent on top. The Implementation-Log entries above (A.1 through A.17) remain the canonical narrative for the early-development period; this section gives a dated index of what shipped, in reverse chronological order, with cross-references back to the Appendix A entries and to git when applicable.
+
+### 2026-05-22 — Logprob confidence works (responses endpoint); perplexity demoted to advisory; confidence proxy; cloud worker; docs caught up to the critic swap
+
+Committed as `916caed`; 238/238 tests pass.
+
+- **Perplexity / logprobs now functional, via the responses endpoint only.** LM Studio exposes token logprobs on `/v1/responses` alone; `/v1/chat/completions` and `/v1/completions` return `logprobs: null` by design (upstream lmstudio-ai/lms#60). Verified live on the PC (GGUF + MLX gemma) and on the Mac's MLX engine. `signals/perplexity.ts` now uses the responses path; the echo-rescore and chat-completions paths remain as fallbacks for hosts that expose logprobs differently (vLLM `prompt_logprobs`, TGI `decoder_input_details`, llama.cpp `n_probs`).
+- **New `signals/confidence.ts`.** Maps a token-logprob stream to a band (ok / mild / low / very_low) and a recommended depth, on three axes: weakest token, whole-answer perplexity, and low-confidence density. Framed as model uncertainty, never correctness.
+- **Perplexity demoted to advisory (§ 6, § 7).** A three-member Opus panel found the signal blind to confident, fluent hallucinations and noisy on rare-but-correct wording. It no longer contributes to the consensus; `aggregator.ts` drops the `perplexity flagged -> warn` rule. The consistency check is the deep-mode spine.
+- **Cloud worker (§ 12).** `WORKER_ENDPOINT` / `WORKER_API_KEY` thread through every worker call, so a cloud model can be the worker for deep and deeper modes. Standard `/verify` never calls the worker.
+- **Confidence proxy (§ 12, `project/src/proxy/`).** Optional transparent proxy for external chat apps. Pass-through for everything except a fully serviceable plain-text request, which routes once through `/v1/responses` for exact, free logprobs plus a note. Capability matrix in `docs/confidence-proxy.md`.
+- **Docs caught up to the 2026-05-12 critic swap.** The § 3 line-up, Critic B description, family-diversity note, and the Known-limits / Deferred entries still named Granite 3.2 and "thinner than v1"; they now reflect Granite 4.1 8B (IBM) + Ministral 3B (Mistral), three vendors. `config.ts` had been correct since the swap; only the prose lagged.
+
+### 2026-05-20 — Phase A through F commit wave + initial git import + critic-model swap + `web/` landing page
+
+The entire codebase was committed to a fresh git repository on this date in 9 commits between 05:01:34 and 05:46:20 +0100, with two further parallel workstreams (critic-model swap and `web/` page build) following immediately after. Two Claude Code sessions drive this date end-to-end, both launched from the Lore project's working directory (which is why no transcript exists under `C:\Users\johnn\.claude\projects\C--AI-verify\`):
+
+- **Session `60f4f2d1-da52-4efd-8375-2549c6a87dc3`** (Lore project, 14 MB, 5,323 lines) — opened 2026-05-09T20:14 with *"Examine `C:\AI\verify` and consider whether the code and the system can be made more efficient, faster, easier to maintain"*. Ran intermittently over 11 days, culminating in a sustained 04:00-04:50 block on 2026-05-20 that produced the 9 commits below plus the critic-model swap.
+- **Session `5ab66aa5-fc14-445f-abc3-cc8810dd5e99`** (Lore project, 3.1 MB, 417 lines) — opened 2026-05-20T04:21 with *"Delegate a panel of agents to create a web animation that shows what Verity does. It should look like something Apple would do to explain important features"*. Produced the `web/` directory in ~31 minutes via six parallel section agents.
+
+The Phase A-F push was driven by **six parallel code-review subagents** dispatched ~03:55 on 2026-05-20 (the user's preceding prompt at 2026-05-12: *"Delegate agents to do a `/code-review` of all verity"*). Each review covered a disjoint surface — pipeline + aggregator + config; critics + NLI + claim extraction; `/second`; MCP server + tool surface; operational scripts + tests; audit-plan synthesis — and returned CRITICAL/IMPORTANT/NICE-TO-HAVE/POSITIVE structured reports. A subsequent steelman/skeptic agent pair argued the findings before the Phase A-F TodoWrite landed at 04:05 with 35 numbered items mapped to specific files and lines. Each phase shipped under a build → 175/175-test → `git commit` → `git push backup master` gate. The commit messages reproduce the audit findings; the underlying audit reports are in the subagent transcripts under `60f4f2d1.../subagents/`. File mtimes show much wider scope than the 9 commits suggest: 8 TypeScript source files (`aggregator.ts`, `pipeline.ts`, `consult.ts`, `recompute.ts`, `classifier.ts`, `index.ts`, `prompts.ts`, `client.ts`), the test suite, all of `dist/`, plus a new `web/` directory containing six HTML section files totalling ~166 KB. All commits report "Tests: 175/175 pass."
+
+**Parallel critic-model swap (04:50, after Phase F polish).** A background research subagent (`abaf97e100afaf330`) ran 04:07-04:08 surveying 2026 Granite alternatives — Granite 4.1 (Apr 29 2026), Llama 3.1/3.2, Ministral-3, OLMo 3, Gemma 4, Phi-4-mini, ZAYA1-8B — against the 8 GB weak-card constraint and the cross-family-diversity goal. Recommendation: `granite4.1:8b` (post-trained with LLM-as-Judge filtering, IFEval 87.1, BFCL V3 68.3) + `llama3.2:3b`. The user accepted Granite 4.1 but rejected Llama 3.2 as too old; the agent re-shortlisted and landed on `ministral-3:3b` (Mistral AI, December 2025 "instruct-2512" build, Apache 2.0, MCP-validated tool calling). Both models pulled successfully in background. `config.ts` defaults updated at 04:50 with explanatory comments. **Net effect: cross-family axis restored** — IBM (Granite) + Mistral + Qwen worker = three pretraining corpora. The `design.md` § 3 "thinner than v1" caveat and Appendix A.13's `granite_3_2_8b` / `granite_3_2_2b` wire ids both pre-dated this swap and lagged the code; rather than chase the model with another model-specific rename, the follow-up landed later the same day as a generic `critic_a` / `critic_b` pair (see A.13 "2026-05-20 follow-up"), so future swaps don't drag the wire id with them.
+
+**`web/` landing page (04:21-04:52).** The 5ab66aa5 session dispatched six parallel section agents (hero, problem, panel, flow, checks, architecture) plus the orchestrator wrote `index.html` shell + nav + Quickstart CTA in the same window. Engineering constraints honoured: scoped CSS prefixes per section, transform/opacity-only animations gated behind `@media (prefers-reduced-motion: no-preference)`, no emojis/external fonts/images/network calls/framework deps, reveals via existing `[data-reveal]` + `data-reveal-delay` + IntersectionObserver-driven `verity:section-enter` events in `scroll.js`. Verified mobile rendering at 375 px (the preview tool times out on desktop viewports under the heavy SVG/CSS animation load). The user immediately followed up by asking the assistant to review `https://www.iccl.ie/digital-data/verity-mcp/` — the first transcript-anchored evidence of a public publication target for Verity. The `_assemble.py` script that concatenates fragments into `index.html` was already present pre-session.
+
+**Other 2026-05-20 transcript-evidenced facts not in the commit bodies:**
+- Two backup-mirror remotes are configured: `C:\AI\verify\.git` (working) + `C:\AI\backups\verity.git` (bare). Each commit was `git push backup master`-ed immediately.
+- No `gh` CLI is installed. A GitHub mirror would need `winget install GitHub.cli` first.
+- Phase A-F's "build + test + commit" loop took ~45 minutes wall-clock end-to-end across 9 commits, gated by the 175-test suite at every step.
+
+- **`190c8b6` 05:46:20 — Phase F polish (final).** F1: trim `verify_answer` tool description from ~3.5 k chars to ~1.6 k (Qwen 3.5 9B was spending up to ~7 s reconciling overlapping FLOW / DO NOT / ALSO CALL sections; the agent-preface inside the rendered block already enforces paste-verbatim co-located with the data). F3: promote seven inline truncation budgets (120 / 140 / 400 / 600 / 800 / 1000) from `aggregator.ts` to named constants in `config.ts`, each one documenting which renderer cell or finding bullet it sizes. See also A.15.
+- **`db9c398` 05:42:58 — Phase E (part 3) + Phase F polish.** E14: `VerifyOutput.critics` is now `Record<string, CriticResult>` keyed on critic id rather than a literal object listing each id statically — adding or renaming a critic is now a one-file change in `critic-configs.ts`. E15: `Warm-CriticModels` reads warmup targets from `ollama /api/tags` rather than hardcoding model names; survives critic swaps without code change. E16: defensive ICD-array handling in `Get-AmdVulkanIcd` (some AMD drivers register multiple Vulkan ICD paths on one registry value as a string array; the `[string]` cast had been joining them with whitespace). E17: remove dead `Apply-VerityQwenConfig` / `Revert-VerityQwenConfig` pair from `start-verity.ps1` (disabled 2026-05-11 after the empty `operation.fields` broke LM Studio chat-schema validation; AMD-pinning launcher now solves the original problem). E18: new `-SkipProbe` switch on the AMD launcher (the synchronous 60 s `/api/generate` Probe-LoadModel can wedge the launcher for a full minute on cold start). F2: hash the `(endpoint, apiKey)` cache key in `llm/client.ts` with SHA-256 so the literal API key never appears in the Map's key space. F4: replaced stale critic-config header comments still referring to Phi-4-mini and Nemotron Mini (last used 2026-04-17).
+- **`b1ff283` 05:35:10 — Phase E (part 2): renderer & verdict-logic polish.** E7: strip backticks from recompute-mismatch `expr_text` before wrapping in inline-code backticks (an expression text containing a backtick would close the inline-code span prematurely). E8: use `CONSISTENCY_FAIL_THRESHOLD` / `CONSISTENCY_WARN_THRESHOLD` from `config.ts` for the consistency chip colour rather than hardcoded 0.5 / 0.15. E9: move `AGGREGATOR_WEIGHTED_VOTE` from direct `process.env` to an exported config.ts constant with full `[ADAPT]` documentation. E10: generalise `computeDisputes` to all C(n,2) critic pairs (no-op on the current 2-critic panel; matters if `CRITIC_C` is ever re-enabled). E12: pass `amdModelName` explicitly through the analysis pass (`renderDisputesTable` / `renderDisputesMarkdown` / `analysisUserPrompt` had hardcoded "Granite 3.2 8B" even though `SECOND_OPINION_MODEL` is configurable). E13: `buildDatePreamble` uses local TZ rather than UTC (users near midnight in their local zone would otherwise see "today" off by a day).
+- **`860955f` 05:25:49 — Phase E (part 1): timer hygiene + concurrency robustness.** E2: move `clearTimeout` to `finally` in `call-critic.ts` and `extract-claims-llm.ts` so the `AbortController` timer is always cleared (the prior `clearTimeout` inside `try` was unreachable on throw; orphan setTimeouts fired on dead AbortControllers and kept the Node event loop alive past process intent). E3: cache the lazy NLI pipeline promise only on success in `classifier.ts` (a rejected promise from a cold-load OOM was poisoning every subsequent `classifyEntailment` call). E4: surface partial-sample failure in `ConsistencyResult.notes` ("Generated N/M alternate samples; K sample(s) failed"). E5: parallelise per-claim entailment classification via `Promise.all` (sequential JS-side awaits had been the dominant cost on premise-bearing `/verify` calls with `NLI_MAX_CLAIMS=14`). E6: wrap each pipeline signal with its own timeout-with-fallback so a global ceiling preserves partial work (the outer `Promise.all` on pipeline timeout was discarding every critic / NLI / recompute result that had finished, replacing the whole tuple with synthesised "timed out" stubs).
+- **`7304d17` 05:20:47 — Phase D: /second tool robustness.** D1: bound `withEndpointLock` acquisition (the per-endpoint promise chain had no timeout; a leaked prior promise — e.g. an `AbortController` failed to cancel an underlying HTTP socket — would wedge subsequent callers forever). Lock acquisition now races against `ENDPOINT_LOCK_MAX_WAIT_MS` (5 minutes). D2: split `extractAnalysisJson` into a detailed variant distinguishing three failure modes — `empty`, `no_json_found` (the canonical runaway-reasoning-trace failure where the model consumes `max_tokens` without ever emitting JSON), and `parse_error` (a candidate JSON span found but `JSON.parse` rejected). The backwards-compatible wrapper is preserved.
+- **`ae18161` 05:18:36 — Phase C: ReDoS hardening + regex concurrency safety.** C1: cap `ARITHMETIC_RE`'s expr quantifier to `{2,200}` (the unbounded `{2,}` let the engine do quadratic work on adversarial input; the post-filter length check at line 288 had been happening AFTER the engine had already spent the time). C2: eliminate shared-regex `lastIndex` races — six module-level regexes with the `g` flag (`ARITHMETIC_RE`, `LEAP_DAYS_RE`, `LINEAR_EQ_RE`, `VAR_CLAIM_RE`, the `UNIT_CONSTANTS` specs, and all `INJECTION_PATTERNS` entries) had been reset via `re.lastIndex = 0` before each use; with concurrent `/verify` calls on the same Node process, one's reset would corrupt the other's iteration position. Each call now constructs a fresh `RegExp` instance via `new RegExp(RE.source, RE.flags)`. C3: cap the approval-mode injection pattern's `[^.]*?` to `[^.]{0,200}?` (unbounded lazy quantifier on a permissive character class was a textbook ReDoS surface).
+- **`7ebf147` 05:14:43 — Phase B: security hardening.** B1: replace the 50 MB `express.json` limit with `MAX_REQUEST_BYTES` (4 MB default; override via `VERITY_MAX_REQUEST_BYTES`). Add per-field char caps (`MAX_QUESTION_CHARS=32k`, `MAX_ANSWER_CHARS=200k`, `MAX_PRIOR_CONTEXT_CHARS=800k`) enforced in `handleToolCall` before pipeline dispatch. B2: bind the HTTP server to `127.0.0.1` by default rather than `0.0.0.0` — Verity has no authentication and trusts every caller; localhost binding eliminates the session-hijack surface for the default deployment. Override via `VERITY_HOST`. E1 (rolled in): validate enum membership for `mode` / `task_type` / `context_mode` before casting (the previous `as TaskType` bypassed validation; a caller passing `task_type: "rm -rf"` reached the pipeline unchecked). B3: defensive installer hardening — `Set-StrictMode -Version Latest` and `ValidatePattern` on `-RepoUrl` accepting only `https github.com` URLs in `install-verity.ps1`; `set -euo pipefail` and matching REPO_URL regex in `install-verity-mac.command` (was just `set -e`); dropped a no-op `cd`.
+- **`e2375e9` 05:10:00 — Phase A: critical correctness fixes.** A1: drop the 500 ms inter-critic await + 100 ms pre-loop sleep in `pipeline.ts`; critics now fire genuinely in parallel via `ALL_CRITICS.map`. The original guard against an Ollama cold-load race is no longer relevant because `OLLAMA_MAX_LOADED_MODELS=2` keeps both critics resident. Wall-clock savings: ~500 ms per `/verify`. A2: wrap `extractClaimsLLM` in try/catch (the function documents null-on-failure but a hard throw bypassed the regex fallback). A3: replace raw `fetch` on `${OLLAMA_URL}/chat/completions` with the shared `getLlmClient` (the raw call 404s when `OLLAMA_URL` is the documented root URL without `/v1/`, and every LLM-NLI claim silently returned null). A3+E11: replace naive `text.match(/\{[\s\S]*?\}/)` JSON extraction with `stripReasoningTraces` + `findBalancedJsonObject`. A4: fix the unsupported-escalation comment that claimed `maxSeverity >= 1` while the code used `WARN_SEVERITY_THRESHOLD` (currently 2). Updated `displayName-reflects-model` test to the post-2026-05-12 role-only design.
+- **`619540b` 05:01:34 — Initial commit: Verity multi-agent verification MCP server.** First git initialisation of the project. 87 files, ~27,798 insertions. Snapshot of everything pre-existing at that moment: MCP server source under `project/src/`, operational scripts (`start-verity.ps1`, `install-verity.ps1`, `install-verity-mac.command`, `CLI/ollama-amd.ps1`), documentation (`readme.md` + `design.md` at root), the parallel `GITHUB/` copy prepared for public release, and the 175-test suite under `project/src/__tests__/`. Excluded via `.gitignore`: `node_modules/`, `dist/`, `*.tsbuildinfo`, `project/verifier-backup-*`, `project/verifier-archive/`, `.env`, `*.log`. Every prior change in this design doc's Appendix A predates this commit and is not represented in git history.
+
+### 2026-05-13 — design.md and readme.md mtime baseline
+
+The pre-git design.md and readme.md files reached their current shape on 2026-05-13. The git initial commit a week later carried both forward unchanged. The 60f4f2d1 Lore-launched session was open across this date but the visible turns are short clarification questions; the substantive documentation work is upstream of this.
+
+### 2026-05-12 — Tool-name and verbose-description reversion (A.15, A.16, A.17) + handshake-race documentation + fake-URL-on-redraft fix
+
+Three Appendix-A fixes plus two significant new findings landed on this date, all visible in Lore session `60f4f2d1-da52-4efd-8375-2549c6a87dc3` (lines ~4290-4540).
+
+**The three documented fixes:** the `verify_answer` tool description was cut back from ~18 k characters to ~6 k after the verbose description fragmented the worker's attention (A.15). The tool was renamed from `verify_previous_answer` to `verify_answer` after smaller workers had been reading "previous" as "the previous turn's answer" (A.16). The rendered Markdown block now echoes the answer at the top under an `## Answer` heading so it is visible in chat regardless of where the worker placed it during composition (A.17).
+
+**Newly anchored: A.14 first-authored on this date.** The full A.14 text (LM Studio MCP plugin handshake race, the 3-phase A/B/C registration model, the 2-6 second window, the sample log timestamps) was written into the design doc at the time then under `C:\AI\Lore\multi-agent-verifier-design.md`. The sample timestamps in A.14 are empirically observed — a scheduled monitor task (`bnz34lk0t`) was set up to watch the LM Studio auth log filtered for `setToolsProvider` and `Client created` events, captured the relevant timing pattern, then handed it to the design-doc Edit. The text in `C:\AI\verify\design.md` today is verbatim from that turn.
+
+**Newly surfaced: fake-URLs-on-redraft.** Same turn (line 4360), the user reported: *"in testing, verity (correctly) said the LLM had not used a plurality of sources. When I asked for a redraft, many sources were given but they were fake…"*. Fix landed in the same session: the "Awaiting your reply" block in `aggregator.ts` lines 885-906 now explicitly says *"Every URL in the redraft MUST be fetched first via the fetch tool to confirm it resolves. Do not invent URLs to address a 'needs more sources' finding — fabricated URLs are worse than no URLs. If you can't find a working source for a claim, drop the claim."*. The same wording was duplicated into the `verify_answer` tool description's "redraft" handler section. This is a textbook instance of the "fix-by-strengthening-the-contract-text" pattern: explicit clauses co-located with the data the worker is about to act on, rather than far-away tool-description clauses the small worker won't reliably follow.
+
+### 2026-05-11 — Wire-id rename: `phi4_reasoning` / `nemotron_mini` → `granite_3_2_8b` / `granite_3_2_2b` (A.13)
+
+The legacy v1 critic keys had been showing up in the worker's reasoning traces as hallucinated critic verdicts — the worker would call `verify_answer`, get the rendered Markdown back, then in its own chain-of-thought invent fake verdicts using the legacy wire ids it remembered from training data. Renamed alongside an explicit "do not invent these names" guardrail in the tool description.
+
+### 2026-05-10 — "Is Verify novel?" + audience-pivot to competent generalist
+
+Lore session `60f4f2d1` line 788 (13:30): *"is Verify novel?"*. Drove the survey subagents on 2026-05-20 (`a5403dc3a442a0e00` commercial+MCP verifiers, `aa9ac0c6c256b2c12` open-source verifiers), and reshaped the design doc / readme audience. Same date, lines 822 + 828: *"What is 'the worker'"* and *"what is an 'off by one'"*. Both questions established that the design doc's audience is competent generalists, not LLM specialists. The plain-English glossary at the top of `design.md` and the framing of `readme.md` both descend from these two questions.
+
+### 2026-05-09 — Long Lore-session begins; A.7 + A.8 + A.12 landed
+
+Lore session `60f4f2d1-da52-4efd-8375-2549c6a87dc3` opens at 20:14 with *"Examine `C:\AI\verify` and consider whether the code and the system can be made more efficient, faster, easier to maintain"*. Same evening, Appendix A.7 (`NLI_REQUIRE_CONTEXT=true` by default — pairwise intra-answer NLI tested as zero signal), A.8 (aggregator off-by-one on the 2-critic panel — gate flipped from `>=` to strict `>`), and A.12 (boot-time NLI warmup + `LlmClient` factory consolidation across 5 call-sites) all landed in this session per their dating tags. The git initial commit of 2026-05-20 carries all three forward; this date is the actual landing, not the commit timestamp.
+
+### 2026-04-21 evening — Folder rename: `C:\AI\verifier\` → `C:\AI\verify\` + project sub-tree split
+
+At 2026-04-21 21:39:37 the user directed: *"Move all files required for verify to `C:\AI\verify` and move all other files from the verify project to `C:\AI\verify\project`."* The Node.js source moved under `project/`; the operational layer (`install-verity.ps1`, `start-verity.ps1`, `Verity.lnk`, etc.) settled at root. This is the rename that created the present odd situation where the directory is named `verify` but every user-visible artefact says "Verity". Captured in session transcript `d8abaaf3-5a2c-4150-9187-05df2cd6b5d2.jsonl` line 2471.
+
+### 2026-04-21 — Phase 3 verify-critic disputes shipped + AMD-Ollama pinning hardened
+
+The `computeDisputes` token-Jaccard 0.4 dispute-detection logic landed between the `verifier-backup-2026-04-20-212456/` and `verifier-backup-2026-04-21-101412/` snapshots (`diff -rq` shows aggregator.ts, pipeline.ts, types.ts and the aggregator test changed). Captured as A.10 above. Also on 2026-04-21: the user directed creation of a desktop shortcut to load AMD Ollama (*"How do we avoid the AMD Ollama issue occuring again? Create a desktop shortcut to load AMD Ollama"* at 22:21) — origin of `CLI/ollama-amd.ps1` and the `Verity.lnk` / `Verity Stop.lnk` launchers. Session: `d8abaaf3`.
+
+### 2026-04-20 evening — Dual-endpoint `/second` dispatch shipped, then reverted
+
+Made `consult_second_opinion` fire two parallel LLM calls — one to Ollama on AMD, one to LM Studio on NVIDIA — putting the worker's idle slice to work alongside the AMD critic. Code passed `npm test` (90/93, 3 pre-existing aggregator failures unchanged), built cleanly, and was then reverted on user direction: *"no keep critics on AMD."* Full restoration recipe with the three file diffs survives at `C:\AI\verify\project\verifier-archive\dual-dispatch-2026-04-20.md`; kill-switch was `PARALLEL_CRITICS=0`. The energy reallocated to Phase 3 verify-critic disputes (above). Session: `d8abaaf3`.
+
+### 2026-04-20 — Multi-reboot stability sequence + verifier-autostart fixes
+
+A run of system crashes (RAM-near-OOM, LM Studio DOWN, Verifier DOWN, AMD card disappearing from LM Studio) traced largely to GPU-affinity environment variables being process-global, so a misconfigured Who-research MCP could push Ollama onto the NVIDIA card and break Verity. Resolution: per-tool launcher scripts that set `VK_DRIVER_FILES` explicitly rather than relying on inherited environment. The HW-threshold monitor task iterated v2 → v3 → v5 across reboots (one-shot alerts, ASCII-only event strings after Unicode broke the task-notification renderer, tighter RAM-near-OOM gating). User directive at 08:44: *"Amend the automatic loader to check for this problem and fix it in future."* Session: `724ef3f8` → `d8abaaf3`.
+
+### 2026-04-19 — Recompute pass design + Nemotron Mini critic test (negative result)
+
+User prompted (`724ef3f8` L1394): *"would a small nemotron model be better than granite"* — tested, did not improve, removed. Same day saw the deterministic-arithmetic recompute pass go from plan to implementation: *"propose a plan for Deterministic arithmetic / enumeration recompute pass"* (L1408). Captured as A.9 above (the recompute / NLI-suppression rule pair).
+
+### 2026-04-18 — Project genesis: NLI A/B/C test + autonomous test plan + literature review + critic sweep
+
+Day-1 session `724ef3f8` opens with the user's autonomous-test brief: *"read the two md files at `C:\AI` and create a plan to do the following: 1. extensively test and further optimise for accuracy and speed using available system resources... 2. examine scholarly literature in relevant domains and evaluate whether this project contributes anything new. 3. If so, plan a scholarly paper. Do this unattended."* Outputs spanning the day:
+
+- A.5 — NLI model swap from `Xenova/deberta-v3-large-mnli` to `Xenova/nli-deberta-v3-large` (0/6 contradictions caught → decisive on real contradictions)
+- A.6 — Unsupported-claim threshold raised from 1 to 2
+- A.7 — Pairwise intra-answer NLI disabled by default (`NLI_REQUIRE_CONTEXT=true`); tested as zero signal
+- A.4 — WARN severity threshold raised from 1 to 2 to stop nitpick escalation
+- A.2 — 8-candidate small-model sweep on AMD Vulkan at 4 KB context, Q8 KV; Granite 2 B won fastest at 144 tok/s with 4/4 correct
+- A.3 — Three-critic → two-critic refit; `MAX_UNAVAILABLE_CRITICS = 1` so a single transient failure still permits the survivor to vote
+- A.11 — `consult_second_opinion` tool added (pre-final-answer, not post-hoc)
+- A.12 — Boot-time NLI warmup + `LlmClient` factory consolidation (five files used to instantiate per-module OpenAI clients independently; all now route through one cached factory keyed on `endpoint|apiKey`)
+- A.14 — LM Studio MCP plugin handshake race documented (the 2–6 s window where the first chat after restart misses tool registration)
+
+Hardware-equivalence side-research session (`fffb2352`) explored AMD GPUs newer than the RX 5700 XT in European pricing; no upgrade landed.
+
+### Pre-2026-04-18 — Pre-transcript history (Appendix A summary)
+
+The Implementation Log entries A.1 through A.3 capture the pre-transcript period:
+
+- A.1 — Critic A migration from 14 B reasoning on the strong GPU (45 s per verify, KV-cache contention with the worker) through 3.8 B Phi-class on the weak GPU (initial iGPU misrouting → 6 tok/s, then 96 tok/s after AMD pinning) to the final 8 B Granite + 2 B Granite pair both on the weak GPU
+- A.2 — The 8-candidate small-model sweep that selected Granite (recorded 2026-04-18 above)
+- A.3 — Three-critic to two-critic refit (KV-cache spill above the 8 GB ceiling at three Q4 critics, Ollama evicting mid-call costing ~3 s cold-load on every other verification)
+
+No git history exists for any pre-2026-05-20 work. The Appendix A narrative above is the canonical record of these early decisions.
