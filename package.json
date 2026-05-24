@@ -1,6 +1,6 @@
 {
   "name": "@modelcontextprotocol/server-verity",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Verity — multi-agent verification MCP server for LM Studio",
   "license": "MIT",
   "type": "module",
@@ -14,7 +14,13 @@
     "proxy": "node dist/proxy/server.js",
     "cli": "node dist/cli.js",
     "watch": "tsc -p project/tsconfig.json --watch",
-    "test": "tsc -p project/tsconfig.json && node --test dist/__tests__/*.test.js"
+    "test": "tsc -p project/tsconfig.json && node --test dist/__tests__/*.test.js",
+    "bench:ragtruth": "tsc -p project/tsconfig.json && node project/scripts/bench-ragtruth.ts",
+    "bench:aggrefact": "tsc -p project/tsconfig.json && node project/scripts/bench-aggrefact.ts",
+    "bench:faithbench": "tsc -p project/tsconfig.json && node project/scripts/bench-faithbench.ts",
+    "bench:halueval": "tsc -p project/tsconfig.json && node project/scripts/bench-halueval.ts",
+    "bench:anah": "tsc -p project/tsconfig.json && node project/scripts/bench-anah.ts",
+    "calibrate": "tsc -p project/tsconfig.json && node project/scripts/calibrate-thresholds.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

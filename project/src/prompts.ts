@@ -26,7 +26,8 @@ Do not include any prose, markdown fences, or commentary outside the JSON.
   "verdict": "pass" | "warn" | "fail",
   "severity": 0 | 1 | 2 | 3 | 4 | 5,
   "concerns": ["concise concern 1", "concise concern 2"],
-  "suggested_fixes": ["concise fix 1", "concise fix 2"]
+  "suggested_fixes": ["concise fix 1", "concise fix 2"],
+  "disputed_span": "short verbatim quote from the answer (omit on pass)"
 }
 
 Severity scale:
@@ -44,6 +45,15 @@ Verdict rules:
 
 If you find nothing wrong, return:
   { "verdict": "pass", "severity": 0, "concerns": [], "suggested_fixes": [] }
+
+Disputed span rules:
+  When verdict is "warn" or "fail", include "disputed_span": a verbatim
+  short quote (50 words or fewer) lifted from the assistant answer that
+  triggered the concern. It must be an exact substring of the answer text,
+  copied character for character. Do not paraphrase, summarise, or rewrite.
+  When verdict is "pass", omit the field (or set it to null).
+  If a single concern spans several places in the answer, pick the most
+  diagnostic short stretch.
 
 Be specific and concrete. Do NOT make up issues to appear thorough.
 A false positive is worse than a missed nit.

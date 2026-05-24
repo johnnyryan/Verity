@@ -35,6 +35,15 @@ export interface CriticResult {
   concerns: string[];
   /** Suggested fixes for the concerns, in matching order where possible. */
   suggested_fixes: string[];
+  /**
+   * Optional verbatim quote from the answer that triggered the critic's
+   * disagreement. Borrowed from HalluGuard's SRM evidence span. Parsed
+   * from the critic's `disputed_span` field (snake_case on the wire).
+   * Display only — does not influence verdict or consensus. Absent when
+   * the critic agreed, omitted the field, or emitted a non-substring
+   * paraphrase that the parser could not validate.
+   */
+  disputedSpan?: string;
   /** Any notes from the pipeline (e.g. "input truncated"). */
   notes: string[];
   /** True if the critic was unreachable or errored. */
@@ -91,6 +100,21 @@ export interface ConsistencyResult {
   divergence_score: number;
   latency_ms: number;
   notes: string;
+  /**
+   * Semantic entropy in nats (Farquhar et al., Nature 2024). High = the
+   * model produced surface-different answers with the same underlying
+   * uncertainty (confabulation). Computed over the same sample stream
+   * the consistency check uses; clustering is by bidirectional NLI
+   * entailment. Optional because it is only available in deep modes
+   * and only when NLI is loaded; the pipeline attaches it post-hoc
+   * (consistency.ts itself does not compute it).
+   *
+   * ADVISORY: surfaced in the rendered Markdown block alongside the
+   * perplexity nudge; never flips the verdict.
+   */
+  semantic_entropy?: number;
+  /** Distinct-meaning cluster count over the sample stream. */
+  semantic_cluster_count?: number;
 }
 
 /**

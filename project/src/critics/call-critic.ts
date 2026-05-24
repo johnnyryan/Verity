@@ -210,6 +210,10 @@ export async function callCritic(
       severity: parsed.severity,
       concerns: parsed.concerns,
       suggested_fixes: parsed.suggested_fixes,
+      // Lift snake_case wire field to camelCase TS field. Undefined
+      // when the critic agreed or omitted the value; the render path
+      // hides the row when absent so old critics keep working.
+      disputedSpan: parsed.disputed_span,
       notes,
       latency_ms: Date.now() - start,
       weight: cfg.weight ?? 1,

@@ -22,8 +22,14 @@
  * signal than critics, change the logic here.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
   AGGREGATOR_WEIGHTED_VOTE,
+  CALIBRATED_THRESHOLDS_ADDITIVE_ONLY,
+  CALIBRATED_THRESHOLDS_PATH,
   FAIL_SEVERITY_THRESHOLD,
   WARN_SEVERITY_THRESHOLD,
   MAX_UNAVAILABLE_CRITICS,
@@ -49,6 +55,210 @@ import type {
   Verdict,
   VerifyOutput,
 } from "./types.js";
+
+// ─── Conformal-threshold load path ────────────────────────────────────────
+//
+// Reference: Yadkori et al., "To Believe or Not to Believe Your LLM" /
+// "Conformal Abstention", 2024 (arXiv:2405.01563); Quach et al.,
+// "Conformal Language Modeling", 2023 (arXiv:2306.10193).
+//
+// Pick alpha (target residual error rate), compute the (1-alpha)-quantile
+// of nonconformity scores on a held-out calibration set, and use those as
+// the warn / fail gate cut-offs. Finite-sample guarantee. We load the
+// thresholds from a JSON file if present and fall back to the v1
+// defaults in config.ts otherwise. The renderer logs which source is in
+// use on startup so a degraded run is visible.
+//
+// Schema:
+//   {
+//     "alpha": 0.1,                            // target residual error
+//     "calibration_set_size": 250,             // n
+//     "warn_score_threshold":   0.42,
+//     "fail_score_threshold":   0.78,
+//     "calibrated_at":          "2026-05-23T08:00:00Z",
+//     "dataset":                "ragtruth+aggrefact"
+//   }
+//
+// Cut-offs are scalar nonconformity scores in the same units the
+// calibration emitter writes. See `project/scripts/calibrate-thresholds.ts`
+// and `docs/calibration.md`.
+
+export interface CalibratedThresholds {
+  alpha: number;
+  calibration_set_size: number;
+  warn_score_threshold: number;
+  fail_score_threshold: number;
+  calibrated_at?: string;
+  dataset?: string;
+}
+
+export interface ThresholdSet {
+  source: "calibrated" | "v1";
+  /** When source==="calibrated", null otherwise. */
+  calibrated?: CalibratedThresholds;
+  /** When source==="calibrated", the path the file was loaded from. */
+  loadedFrom?: string;
+}
+
+/**
+ * Resolve the path to the calibrated-thresholds JSON file. Relative paths
+ * resolve against the directory of THIS source file, so the file can ship
+ * next to aggregator.ts in `project/src/calibrated-thresholds.json` and
+ * the runtime resolves to `dist/calibrated-thresholds.json` (build step
+ * copies it; if it doesn't, the loader falls through to v1 and
+ * the startup log records that the file was absent).
+ */
+function resolveCalibratedThresholdsPath(): string {
+  if (!CALIBRATED_THRESHOLDS_PATH) return "";
+  if (path.isAbsolute(CALIBRATED_THRESHOLDS_PATH)) {
+    return CALIBRATED_THRESHOLDS_PATH;
+  }
+  // import.meta.url points at dist/aggregator.js at runtime.
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, CALIBRATED_THRESHOLDS_PATH);
+}
+
+/**
+ * Load calibrated thresholds from disk, or return null if the file is
+ * absent / malformed. Never throws — a misconfigured file falls back to
+ * v1 silently in production; the startup log carries the only
+ * record of which source is in use.
+ */
+/**
+ * True when this module is being loaded inside a `node --test` run. Used by
+ * the calibration loader and the startup log to skip work that would
+ * pollute test output or shift verdict assertions. Single source of truth
+ * so the two skip paths cannot drift (a v0.2.1 review found the two had
+ * diverged: loader checked `NODE_TEST_CONTEXT !== undefined`, log
+ * checked `=== "1"`, and Node actually sets it to `"child"`).
+ */
+const IS_UNDER_TEST =
+  typeof process !== "undefined" &&
+  process.env.NODE_TEST_CONTEXT !== undefined;
+
+function tryLoadCalibratedThresholds(): {
+  thresholds: CalibratedThresholds | null;
+  path: string;
+} {
+  // Under node --test, never load. Existing test suites assume the
+  // v1 ladder; an inherited dist/calibrated-thresholds.json from
+  // a developer's earlier calibration run would otherwise silently shift
+  // verdicts under bidirectional mode. Tests that exercise the calibration
+  // path mutate ACTIVE_THRESHOLDS locally.
+  if (IS_UNDER_TEST) return { thresholds: null, path: "(skipped under test)" };
+  const resolved = resolveCalibratedThresholdsPath();
+  if (!resolved) return { thresholds: null, path: "" };
+  if (!fs.existsSync(resolved)) return { thresholds: null, path: resolved };
+  try {
+    const raw = fs.readFileSync(resolved, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CalibratedThresholds>;
+    if (
+      typeof parsed.alpha !== "number" ||
+      typeof parsed.warn_score_threshold !== "number" ||
+      typeof parsed.fail_score_threshold !== "number" ||
+      typeof parsed.calibration_set_size !== "number"
+    ) {
+      console.error(
+        `[aggregator] calibrated-thresholds file at ${resolved} is missing ` +
+          `required numeric fields; falling back to v1 defaults.`
+      );
+      return { thresholds: null, path: resolved };
+    }
+    return {
+      thresholds: {
+        alpha: parsed.alpha,
+        calibration_set_size: parsed.calibration_set_size,
+        warn_score_threshold: parsed.warn_score_threshold,
+        fail_score_threshold: parsed.fail_score_threshold,
+        calibrated_at: parsed.calibrated_at,
+        dataset: parsed.dataset,
+      },
+      path: resolved,
+    };
+  } catch (err) {
+    console.error(
+      `[aggregator] failed to parse calibrated-thresholds at ${resolved}:`,
+      err
+    );
+    return { thresholds: null, path: resolved };
+  }
+}
+
+const LOADED_THRESHOLDS = tryLoadCalibratedThresholds();
+
+/**
+ * Effective threshold set in use for this process. Public so tests + the
+ * pipeline can inspect which source is active.
+ */
+export const ACTIVE_THRESHOLDS: ThresholdSet = LOADED_THRESHOLDS.thresholds
+  ? {
+      source: "calibrated",
+      calibrated: LOADED_THRESHOLDS.thresholds,
+      loadedFrom: LOADED_THRESHOLDS.path,
+    }
+  : { source: "v1" };
+
+// One-time startup log so a deploy that silently failed to ship the
+// calibration file is visible. Skipped under `node --test` (same gate as
+// the loader; see IS_UNDER_TEST above) to keep test output clean.
+if (!IS_UNDER_TEST) {
+  if (ACTIVE_THRESHOLDS.source === "calibrated") {
+    const t = ACTIVE_THRESHOLDS.calibrated!;
+    const mode = CALIBRATED_THRESHOLDS_ADDITIVE_ONLY
+      ? "ADDITIVE-ONLY"
+      : "BIDIRECTIONAL";
+    console.error(
+      `[aggregator] using CALIBRATED thresholds from ${ACTIVE_THRESHOLDS.loadedFrom} ` +
+        `(mode=${mode}, alpha=${t.alpha}, n=${t.calibration_set_size}, ` +
+        `warn=${t.warn_score_threshold}, fail=${t.fail_score_threshold})`
+    );
+  } else {
+    console.error(
+      `[aggregator] using V1 thresholds from config.ts ` +
+        `(calibrated-thresholds.json not found at ${LOADED_THRESHOLDS.path || "(unset)"})`
+    );
+  }
+}
+
+/**
+ * Continuous nonconformity score used by the conformal-calibration gate.
+ *
+ * The bench harness emits the same formula into the calibration JSONL via
+ * `project/scripts/bench-common.ts hallucinationScore()`. Keeping the two
+ * paths identical is the whole point — calibration sets thresholds on a
+ * distribution of these scores, and the aggregator must decide verdicts
+ * on the same distribution at runtime. Pre-2026-05-24 the aggregator used
+ * a thinner sum (disagree-count + flag-counts only) while the bench used
+ * the richer sum below; the mismatch produced calibrated thresholds that
+ * could never be crossed at runtime and was the cause of the
+ * "all rows pass" failure on the first bidirectional sweep.
+ *
+ * Components:
+ *   NLI contradictions count
+ *   NLI unsupported count
+ *   recompute mismatches count
+ *   per critic (skipping unavailable): severity (0-10) + concerns.length
+ *   consistency divergence_score x 5
+ */
+export function computeNonconformityScore(args: {
+  critics: CriticResult[];
+  nli: NliResult;
+  recompute?: RecomputeResult;
+  consistency?: ConsistencyResult;
+}): number {
+  let s = 0;
+  s += args.nli.contradictions.length;
+  s += args.nli.unsupported.length;
+  s += args.recompute?.mismatches?.length ?? 0;
+  for (const c of args.critics) {
+    if (c.unavailable) continue;
+    s += c.severity ?? 0;
+    s += c.concerns?.length ?? 0;
+  }
+  const div = args.consistency?.divergence_score;
+  if (div != null) s += div * 5;
+  return s;
+}
 
 export interface AggregatedResult {
   consensus: Verdict;
@@ -227,6 +437,28 @@ export function aggregate(
   const maxSeverity = available.reduce((m, c) => Math.max(m, c.severity), 0);
   const totalConcerns = available.reduce((n, c) => n + c.concerns.length, 0);
 
+  // 2026-05-23: verbosity-bias check (Zheng et al., 2023, MT-Bench /
+  // Chatbot Arena, arXiv:2306.05685). Reviewed the rule set below
+  // against the LLM-as-judge verbosity-bias risk: does the verdict get
+  // stronger when a critic raises more concerns?
+  //
+  // No. The aggregator below is rule-based on:
+  //   - maxSeverity (max over critic.severity, a 0-5 scalar)
+  //   - failOverriddenByHigherWeightPass (weighted vote, opt-in)
+  //   - NLI contradictionCount and unsupportedCount
+  //   - recompute mismatches
+  //   - consistency divergence and contradicted count
+  // None of these are sensitive to len(critic.concerns). totalConcerns
+  // is computed for the SUMMARY TEXT only (buildSummary) and never
+  // routed through the verdict ladder. A critic that listed 1 concern
+  // versus 8 concerns at the same severity therefore lands the same
+  // verdict — verbosity does not weight outcomes here. Zheng 2023
+  // verbosity-bias is not applicable to this aggregator.
+  //
+  // If a future change weights by concern count (e.g. "a critic with 5+
+  // concerns counts as a soft warn"), apply length-normalisation here.
+  // Until then, no code change required.
+
   // 2026-04-20 — deterministic recompute pass integration.
   //
   // Rule 1 (hard fail): any recompute mismatch is a confident failure.
@@ -335,6 +567,49 @@ export function aggregate(
     consensus = "warn";
   } else {
     consensus = "pass";
+  }
+
+  // Conformal calibration. When a calibrated threshold set is loaded
+  // (Yadkori 2024 / Quach 2023), the nonconformity score relative to the
+  // calibrated cut-off decides pass / warn / fail.
+  //
+  // Default mode (CALIBRATED_THRESHOLDS_ADDITIVE_ONLY=0): BIDIRECTIONAL.
+  // The calibrated thresholds ARE the decision boundary. The score
+  // directly places the verdict; the v1 ladder above contributes
+  // its counts to the nonconformity score but does not gate the verdict.
+  // This is the textbook conformal-prediction behaviour and the only
+  // mode that can fix over-flagging. From 2026-05-24 onward.
+  //
+  // Legacy mode (CALIBRATED_THRESHOLDS_ADDITIVE_ONLY=1): ESCALATION-ONLY.
+  // Calibrated cut-offs can only push pass → warn → fail, never the
+  // reverse. The 2026-05-23 RAGTruth sweep showed this mode cannot fix
+  // over-flagging; preserved as an opt-in safety mode.
+  //
+  // "error" verdicts (too many critics unavailable) early-return at the
+  // top of aggregate(); they never reach this block.
+  if (ACTIVE_THRESHOLDS.source === "calibrated") {
+    const t = ACTIVE_THRESHOLDS.calibrated!;
+    const score = computeNonconformityScore({
+      critics,
+      nli: { ...nli, contradictions: filteredContradictions, unsupported: filteredUnsupported },
+      recompute,
+      consistency: deep?.consistency,
+    });
+    if (CALIBRATED_THRESHOLDS_ADDITIVE_ONLY) {
+      if (consensus !== "fail" && score >= t.fail_score_threshold) {
+        consensus = "fail";
+      } else if (consensus === "pass" && score >= t.warn_score_threshold) {
+        consensus = "warn";
+      }
+    } else {
+      if (score >= t.fail_score_threshold) {
+        consensus = "fail";
+      } else if (score >= t.warn_score_threshold) {
+        consensus = "warn";
+      } else {
+        consensus = "pass";
+      }
+    }
   }
 
   // Disputes are computed *after* consensus is assembled so aggregator
@@ -663,10 +938,26 @@ export function renderSummaryMarkdown(
       state === "unable"
         ? checkChip(state)
         : `${checkChip(state)} (${c.severity}/5)`;
-    const detail = c.concerns[0]
-      ? `"${truncateCell(escapeMarkdownCell(c.concerns[0]), RENDER_CELL_CONCERN_CHARS)}"`
-      : "no concern raised";
-    testingRows.push(`| **${model}** (critic) | ${sevLabel} | ${detail} |`);
+    const detailParts: string[] = [];
+    detailParts.push(
+      c.concerns[0]
+        ? `"${truncateCell(escapeMarkdownCell(c.concerns[0]), RENDER_CELL_CONCERN_CHARS)}"`
+        : "no concern raised"
+    );
+    // Disputed span (HalluGuard-style verbatim quote from the answer
+    // that triggered the disagreement). Display only — never alters the
+    // verdict. Appended on a second visual row inside the same Detail
+    // cell via <br>, so the existing three-column shape and snapshot
+    // tests keep working. Absent on agreement (or when the critic
+    // omitted the field), so old critics behave as before.
+    if (c.disputedSpan && c.disputedSpan.length > 0) {
+      detailParts.push(
+        `<br>_disputed span:_ "${truncateCell(escapeMarkdownCell(c.disputedSpan), RENDER_CELL_CONCERN_CHARS)}"`
+      );
+    }
+    testingRows.push(
+      `| **${model}** (critic) | ${sevLabel} | ${detailParts.join("")} |`
+    );
   });
 
   // 2b. Recompute pass.
@@ -747,6 +1038,41 @@ export function renderSummaryMarkdown(
     testingRows.push(`| **Consistency** (deep mode) | ${checkChip("skipped")} | ${reason} |`);
   }
 
+  // 2d-bis. Semantic entropy (deep modes only). ADVISORY: surfaces when
+  //         the consistency check ran and the pipeline attached entropy
+  //         fields to it. Like perplexity, never changes the verdict;
+  //         high entropy = surface-different answers with the same
+  //         underlying uncertainty (Farquhar et al., Nature 2024).
+  const semEntropy = consistency?.semantic_entropy;
+  const semClusters = consistency?.semantic_cluster_count;
+  if (
+    consistency?.ran &&
+    typeof semEntropy === "number" &&
+    typeof semClusters === "number"
+  ) {
+    // No threshold gate: log(2) ~= 0.69 nats is the natural "two
+    // distinct meanings on two samples" mark. Anything > 0 is a hint;
+    // present clusters and entropy and let the user read it.
+    const state = semEntropy > 0 ? "warn" : "pass";
+    const detail =
+      `entropy ${semEntropy.toFixed(4)} nats across ${semClusters} ` +
+      `meaning-cluster(s); advisory only, does not change the verdict`;
+    testingRows.push(
+      `| **Semantic entropy** (deep mode, advisory) | ${checkChip(state)} | ${detail} |`
+    );
+  } else if (consistency?.ran) {
+    // Consistency ran but entropy did not (signal disabled or all
+    // samples failed). Skipped row keeps the rendered table stable.
+    testingRows.push(
+      `| **Semantic entropy** (deep mode, advisory) | ${checkChip("skipped")} | did not run (signal disabled or all re-samples empty) |`
+    );
+  } else {
+    const reason = deepSkippedReason(consistency, "did not run");
+    testingRows.push(
+      `| **Semantic entropy** (deep mode, advisory) | ${checkChip("skipped")} | ${reason} |`
+    );
+  }
+
   // 2e. Perplexity / model uncertainty (deep modes only). ADVISORY: this row
   //     is a nudge and does NOT change the consensus (2026-05-22) -- logprob
   //     uncertainty misses fluent hallucinations and fires on rare-but-correct
@@ -808,6 +1134,14 @@ export function renderSummaryMarkdown(
     for (const extra of c.concerns.slice(1, 4)) {
       findings.push(
         `    - also: "${findingText(extra, RENDER_FINDING_EXTRA_CHARS)}"`
+      );
+    }
+    // Disputed span sub-bullet (HalluGuard SRM evidence quote). Renders
+    // only when the critic supplied a verbatim quote from the answer.
+    // Italic label so it does not look like another concern.
+    if (c.disputedSpan && c.disputedSpan.length > 0) {
+      findings.push(
+        `    - _disputed span:_ "${findingText(c.disputedSpan, RENDER_FINDING_EXTRA_CHARS)}"`
       );
     }
     if (c.suggested_fixes && c.suggested_fixes[0]) {

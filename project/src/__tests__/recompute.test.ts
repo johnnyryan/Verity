@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildRecomputeScope,
   runRecomputePass,
   safeEvalArithmetic,
 } from "../signals/recompute.js";
@@ -262,4 +263,110 @@ test("plain prose with no math: no false positives", async () => {
     "Paris is the capital of France. It is a lovely city."
   );
   assert.equal(r.expressions_found, 0);
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// CoVe step-3 independence (Dhuliawala et al., 2023)
+//
+// The recompute pass must source the expression-to-verify from the
+// question, NOT from the draft answer's restated reasoning. With the
+// draft visible the verifier risks anchoring on the draft and
+// reproducing its mistakes. The split is gated by RECOMPUTE_INDEPENDENT
+// (default true); legacy A/B mode (false) restores the pre-2026-05-23
+// single-source behaviour.
+// ────────────────────────────────────────────────────────────────────────
+
+test("CoVe independence: scope does NOT contain the draft answer text", () => {
+  const question = "Solve 3x + 7 = 22";
+  const draftAnswer = "DRAFT_MARKER_ZULU x = 5 because reasons.";
+  const scope = buildRecomputeScope(question, draftAnswer, true);
+  assert.equal(
+    scope.expressionScope.includes("DRAFT_MARKER_ZULU"),
+    false,
+    "independent expressionScope must not include the draft answer text"
+  );
+  assert.equal(
+    scope.expressionScope.includes("Solve 3x + 7 = 22"),
+    true,
+    "independent expressionScope must include the question"
+  );
+  assert.equal(
+    scope.claimScope.includes("DRAFT_MARKER_ZULU"),
+    true,
+    "claimScope is the answer (the draft is only read for the claimed value)"
+  );
+  assert.equal(scope.independent, true);
+});
+
+test("CoVe independence: legacy mode (RECOMPUTE_INDEPENDENT=false) DOES contain draft", () => {
+  const question = "Solve 3x + 7 = 22";
+  const draftAnswer = "DRAFT_MARKER_ZULU x = 5 because reasons.";
+  const scope = buildRecomputeScope(question, draftAnswer, false);
+  assert.equal(
+    scope.expressionScope.includes("DRAFT_MARKER_ZULU"),
+    true,
+    "legacy expressionScope must include the draft answer text for back-compat"
+  );
+  assert.equal(
+    scope.expressionScope.includes("Solve 3x + 7 = 22"),
+    true,
+    "legacy expressionScope must include the question"
+  );
+  assert.equal(scope.independent, false);
+});
+
+test("CoVe independence: degenerate case (no question) falls back to answer-only scope", () => {
+  const scope = buildRecomputeScope(undefined, "3+3 = 6.", true);
+  // No question to factor out; expressionScope IS the answer. The claim
+  // is still in the same source, so independence is vacuous here.
+  assert.equal(scope.expressionScope.includes("3+3 = 6."), true);
+  assert.equal(scope.claimScope, scope.expressionScope);
+});
+
+test("CoVe independence: linear-equation solver uses ONLY the question's equation when independent", async () => {
+  // Question supplies the equation; answer restates a DIFFERENT (made-up)
+  // equation as a draft-anchoring trap. Under independent mode the
+  // solver must ignore the answer's restated equation and solve only
+  // the one in the question.
+  const r = await runRecomputePass(
+    "Re-stating the problem: 3x + 7 = 100. So x = 31.", // wrong restatement + wrong claim
+    "Solve 3x + 7 = 22",
+    { independent: true }
+  );
+  const linear = r.verifications.filter((v) => v.kind === "linear-equation");
+  // From the question's equation, x = 5. The answer claims x = 31, so mismatch.
+  assert.equal(linear.length >= 1, true, "should emit at least one verification");
+  const xClaim = linear.find((v) => v.expr_text.toLowerCase().includes("x = 31"));
+  assert.equal(xClaim?.matches, false, "x = 31 must be flagged as mismatch (expected 5)");
+  assert.equal(xClaim?.computed, "5");
+});
+
+test("CoVe independence: legacy mode lets the answer's restated equation seed the solver", async () => {
+  // Same trap as the previous test, but legacy=false. The answer's
+  // re-stated equation 3x + 7 = 100 gets registered before the
+  // question's, so the solver's x = 31 lookup matches.
+  const r = await runRecomputePass(
+    "Re-stating the problem: 3x + 7 = 100. So x = 31.",
+    "Solve 3x + 7 = 22",
+    { independent: false }
+  );
+  const linear = r.verifications.filter((v) => v.kind === "linear-equation");
+  const xClaim = linear.find((v) => v.expr_text.toLowerCase().includes("x = 31"));
+  // Under legacy, the first equation seen wins; whichever order they
+  // hit the regex, the verification is computed against that scope.
+  assert.equal(xClaim !== undefined, true, "legacy mode should still verify x = 31");
+});
+
+test("CoVe independence: with no equation in question, independent mode emits nothing", async () => {
+  // Independent mode strips the answer from the expression scope, so a
+  // question without an equation leaves the solver with nothing to do
+  // even when the answer volunteers one. This is the intended trade-off:
+  // we refuse to verify equations the draft alone supplied.
+  const r = await runRecomputePass(
+    "Pretend the equation is 2x = 10, so x = 5.",
+    "Tell me about variables.",
+    { independent: true }
+  );
+  const linear = r.verifications.filter((v) => v.kind === "linear-equation");
+  assert.equal(linear.length, 0);
 });

@@ -308,6 +308,26 @@ export const WARN_SEVERITY_THRESHOLD = 2;
 export const MAX_UNAVAILABLE_CRITICS = 1;
 
 /**
+ * [ADAPT] Shuffle the critic dispatch order per /verify call.
+ *
+ * Background: Zheng et al., "MT-Bench / Chatbot Arena", 2023
+ * (arXiv:2306.05685), documents three named biases in LLM-as-judge:
+ * position bias, verbosity bias, self-enhancement bias. Verity's
+ * critics don't see each other's verdicts (no debate round), so the
+ * direct LLM-as-judge position bias does not apply within a single
+ * critic call. The shuffle is defensive: anything downstream that
+ * silently treats "first critic" as authoritative (a future debate
+ * mode, a logging consumer that picks index 0, prompt overlap if a
+ * critic ever sees the other's verdict) would inherit a stable bias.
+ *
+ * Default ON. Set CRITIC_SHUFFLE=0 for deterministic tests / replay.
+ *
+ * 2026-05-23.
+ */
+export const CRITIC_SHUFFLE =
+  (process.env.CRITIC_SHUFFLE ?? "1") !== "0";
+
+/**
  * [ADAPT] Opt-in weighted-vote override (default OFF).
  *
  * When ON, a higher-weight critic's `pass` can outvote a lower-weight
@@ -369,6 +389,52 @@ export const CONSISTENCY_FAIL_THRESHOLD = 0.5;
  * [ADAPT] Lower to 0.05 for stricter surfacing of minor inconsistencies.
  */
 export const CONSISTENCY_WARN_THRESHOLD = 0.15;
+
+/**
+ * [ADAPT] Path to a JSON file holding conformally-calibrated thresholds for
+ * the warn / fail gates. When present, the aggregator loads its
+ * nonconformity-score cut-offs from this file in preference to the
+ * v1 defaults above. Calibration is done by
+ * `project/scripts/calibrate-thresholds.ts`; see `docs/calibration.md`.
+ *
+ * Default: `project/src/calibrated-thresholds.json` next to the source
+ * (relative to dist at runtime). Set to an empty string to force the
+ * v1 fallback.
+ *
+ * Reference: Yadkori et al., "To Believe or Not to Believe Your LLM" /
+ * "Conformal Abstention", 2024 (arXiv:2405.01563); Quach et al.,
+ * "Conformal Language Modeling", 2023 (arXiv:2306.10193).
+ */
+export const CALIBRATED_THRESHOLDS_PATH =
+  process.env.VERITY_CALIBRATED_THRESHOLDS_PATH ?? "calibrated-thresholds.json";
+
+/**
+ * When a calibration file is present, are the calibrated cut-offs allowed
+ * to RELAX the verdict (pull warn or fail down to pass when the score is
+ * below threshold), or only ESCALATE it?
+ *
+ * Default: false → bidirectional. The calibrated thresholds are
+ * authoritative when loaded; the conformal score directly determines
+ * pass/warn/fail. This is the textbook conformal behaviour and the only
+ * mode that helps with over-flagging (the dominant failure mode on
+ * datasets like RAGTruth where the v1 multi-axis rules are too
+ * aggressive for the task distribution).
+ *
+ * Set to `1` to restore the legacy escalation-only mode where calibrated
+ * cut-offs can only push pass → warn → fail and never the reverse. Useful
+ * if the v1 ladder is the conservative safety floor and the
+ * calibration is intended only to catch under-flagging.
+ *
+ * Either way, an "error" verdict (too many critics unavailable) is never
+ * overridden — that is a system-state signal, not a quality signal.
+ *
+ * The 2026-05-23 RAGTruth empirical sweep (50 rows standard mode,
+ * pre- vs post-calibration, FPR 1.00 → 1.00 unchanged) showed that
+ * the escalation-only mode cannot fix over-flagging. Bidirectional is
+ * the default from 2026-05-24 onward.
+ */
+export const CALIBRATED_THRESHOLDS_ADDITIVE_ONLY =
+  process.env.VERITY_CALIBRATED_THRESHOLDS_ADDITIVE_ONLY === "1";
 
 // ───────────────────────────────────────────────────────────────────────────
 // NLI settings
@@ -470,19 +536,34 @@ export const NLI_CONTRADICTION_THRESHOLD = 0.65;
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
- * [ADAPT] Number of alternate worker samples to draw in deep mode.
- *   2 samples → ~16 s extra, weak but cheap signal
- *   3 samples → ~24 s extra, the classic SelfCheckGPT setting
- * 2 keeps /verifydeep under ~30 s total.
+ * [ADAPT] Number of alternate worker samples to draw in deep mode (K).
+ *
+ * Both Self-Consistency (Wang et al., 2022, arXiv:2203.11171) and
+ * SelfCheckGPT (Manakul et al., 2023, arXiv:2303.08896) publish K
+ * diminishing-returns curves: K ≥ 5 is the standard sweet spot, with
+ * most of the gain landing by K = 5 and a long tail to ~20. 5 is the
+ * floor we ship as the deep-mode default.
+ *
+ * Cost note: K samples in parallel at ~8 s each per LM Studio queue
+ * slot, so K = 5 lands /verifydeep around the ~40 s mark on this
+ * hardware. Override via CONSISTENCY_K_DEEP if latency is tighter.
  */
-export const CONSISTENCY_SAMPLES_DEEP = 2;
+export const CONSISTENCY_SAMPLES_DEEP = Number(
+  process.env.CONSISTENCY_K_DEEP ?? 5
+);
 
 /**
- * [ADAPT] Number of alternate worker samples in deeper mode.
- *   5–10 samples is the range used in semantic-entropy literature.
- * 5 keeps /verifydeeper under ~60 s total.
+ * [ADAPT] Number of alternate worker samples in deeper mode (K).
+ *
+ * Deeper mode is allowed more compute, so we push further into the
+ * diminishing-returns tail described by Wang 2022 + SelfCheckGPT 2023
+ * (semantic-entropy work uses 5–10 in the same regime). K = 8 is a
+ * solid step past the K = 5 knee without hitting the 10+ ceiling.
+ * Override via CONSISTENCY_K_DEEPER.
  */
-export const CONSISTENCY_SAMPLES_DEEPER = 5;
+export const CONSISTENCY_SAMPLES_DEEPER = Number(
+  process.env.CONSISTENCY_K_DEEPER ?? 8
+);
 
 /**
  * [ADAPT] Sampling temperature for the alternate samples. Higher = more
@@ -490,6 +571,38 @@ export const CONSISTENCY_SAMPLES_DEEPER = 5;
  * convergence. 0.7 matches SelfCheckGPT's default.
  */
 export const CONSISTENCY_TEMPERATURE = 0.7;
+
+/**
+ * [ADAPT] Master switch for the semantic-entropy signal (Farquhar et al.,
+ * Nature 2024). When ON in deep / deeper modes, the pipeline draws a small
+ * extra batch of worker re-samples, clusters them by bidirectional NLI
+ * entailment, and reports the Shannon entropy of the cluster distribution.
+ * Advisory only — never flips the consensus verdict; surfaced in the
+ * rendered Markdown block alongside the perplexity nudge.
+ *
+ * Set VERITY_SEMANTIC_ENTROPY=0 to disable (e.g. for hosts where the worker
+ * is rate-limited or the extra sampling cost is unacceptable).
+ *
+ * 2026-05-23: minimal-interface implementation. The consistency check
+ * generates its own samples internally and does not expose them on the
+ * result type. Rather than rewire consistency.ts (owned by another
+ * agent), the pipeline draws a parallel sample batch for entropy and
+ * attaches `semantic_entropy` / `semantic_cluster_count` to the
+ * consistency result post-hoc.
+ */
+export const SEMANTIC_ENTROPY_ENABLED =
+  (process.env.VERITY_SEMANTIC_ENTROPY ?? "1") !== "0";
+
+/**
+ * [ADAPT] Number of samples to draw for the semantic-entropy signal. Kept
+ * small (3) because the clustering is quadratic in N and the consistency
+ * check is already paying for the bulk of the worker round-trips. Range
+ * 3-5 is reasonable; below 2 the signal degenerates (entropy is always 0
+ * or log(N)).
+ */
+export const SEMANTIC_ENTROPY_SAMPLES = Number(
+  process.env.VERITY_SEMANTIC_ENTROPY_SAMPLES ?? 3
+);
 
 // ───────────────────────────────────────────────────────────────────────────
 // Deep / deeper modes (Signal 2: perplexity / logprobs)
@@ -852,3 +965,35 @@ export const PROXY_UPSTREAM_TIMEOUT_MS = Number(
 export const PROXY_MAX_REQUEST_BYTES = Number(
   process.env.VERITY_PROXY_MAX_REQUEST_BYTES ?? 16 * 1024 * 1024
 );
+
+// ───────────────────────────────────────────────────────────────────────────
+// Recompute pass — CoVe-style independence
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * [ADAPT] When true (default), the deterministic recompute pass sources the
+ * expression-to-verify from the question wherever the question already
+ * supplies one, and uses the answer only to read off the claimed value or
+ * solution. This mirrors step (3) of Chain-of-Verification (Dhuliawala et
+ * al., 2023, arXiv:2309.11495): each verification question is answered
+ * without the original draft visible, so the verifier cannot anchor on the
+ * draft and reproduce its mistakes.
+ *
+ * Concretely, with RECOMPUTE_INDEPENDENT=true:
+ *   - linear-equation: solve only equations that appear in the question;
+ *     read claimed solutions from the answer.
+ *   - enumeration: prefer the question as the source of the
+ *     comprehension / range when it supplies one; fall back to the
+ *     answer when the question does not.
+ *   - arithmetic / leap-year / unit: unchanged — these claims are
+ *     almost always volunteered de novo in the answer, with the
+ *     question carrying no equivalent expression to verify against,
+ *     so the recompute is already independent of any "draft answer
+ *     reasoning" the worker put around them.
+ *
+ * Set VERITY_RECOMPUTE_INDEPENDENT=0 to restore the pre-2026-05-23
+ * behaviour, where every detector treated `question + "\n" + answer`
+ * as a single source string. Useful for A/B comparison only.
+ */
+export const RECOMPUTE_INDEPENDENT =
+  (process.env.VERITY_RECOMPUTE_INDEPENDENT ?? "1") !== "0";

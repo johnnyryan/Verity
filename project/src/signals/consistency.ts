@@ -57,6 +57,9 @@ export async function runConsistencyCheck(params: {
 
   // Step 1: Generate alternate samples.
   //
+  // K (numSamples) defaults: 5 (deep) / 8 (deeper). K >= 5 is the standard
+  // sweet spot per Wang 2022 (arXiv:2203.11171) + SelfCheckGPT 2023 curves.
+  //
   // Reasoning-model workers (Qwen-QwQ, Phi-4-reasoning, DeepSeek-R1) emit
   // <think>…</think> traces before the answer. Those traces are irrelevant
   // to the claim being checked and — worse — drown out the actual answer

@@ -21,6 +21,13 @@ export interface ParsedCriticOutput {
   severity: number;
   concerns: string[];
   suggested_fixes: string[];
+  /**
+   * Verbatim quote from the answer that triggered the critic's
+   * disagreement. Captured from the wire field `disputed_span`. Absent
+   * when the critic agreed, omitted the field, returned null, or
+   * returned an empty string.
+   */
+  disputed_span?: string;
 }
 
 /**
@@ -100,7 +107,28 @@ export function parseCriticJson(raw: string): ParsedCriticOutput | null {
   const concerns = sanitizeStringArray(p.concerns);
   const suggested_fixes = sanitizeStringArray(p.suggested_fixes);
 
-  return { verdict, severity, concerns, suggested_fixes };
+  // Disputed span (optional). Snake-case on the wire, lifted into
+  // ParsedCriticOutput unchanged so the caller can map it to the
+  // camel-case CriticResult.disputedSpan. Treat missing, null, empty,
+  // whitespace-only, and non-string values as absent. Same length cap
+  // as a concern string so a misbehaving critic that returned the
+  // entire answer here cannot bloat the payload. We do not validate
+  // that the value is a substring of the answer at parse time — the
+  // parser has no access to the answer text and shipping the field as
+  // display only means a stray paraphrase only mildly mis-renders;
+  // upstream the prompt already insists on verbatim copying.
+  let disputed_span: string | undefined;
+  if (typeof p.disputed_span === "string") {
+    const trimmed = p.disputed_span.trim();
+    if (trimmed.length > 0) {
+      disputed_span =
+        trimmed.length > MAX_ITEM_LEN
+          ? trimmed.slice(0, MAX_ITEM_LEN) + "…"
+          : trimmed;
+    }
+  }
+
+  return { verdict, severity, concerns, suggested_fixes, disputed_span };
 }
 
 /**

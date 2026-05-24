@@ -148,3 +148,73 @@ test("returns null for truncated JSON", () => {
     null
   );
 });
+
+// ─── Disputed span (HalluGuard-style evidence quote) ──────────────────────
+
+test("captures disputed_span on a disagree verdict", () => {
+  const raw = JSON.stringify({
+    verdict: "fail",
+    severity: 4,
+    concerns: ["wrong capital"],
+    suggested_fixes: ["replace with Paris"],
+    disputed_span: "Paris is the capital of France",
+  });
+  const out = parseCriticJson(raw);
+  assert.ok(out);
+  assert.equal(out.disputed_span, "Paris is the capital of France");
+});
+
+test("disputed_span absent when the critic omitted the field", () => {
+  const out = parseCriticJson(
+    '{"verdict":"pass","severity":0,"concerns":[],"suggested_fixes":[]}'
+  );
+  assert.ok(out);
+  assert.equal(out.disputed_span, undefined);
+});
+
+test("disputed_span explicit null is treated as absent (does not throw)", () => {
+  const out = parseCriticJson(
+    '{"verdict":"warn","severity":2,"concerns":["hedge"],"disputed_span":null}'
+  );
+  assert.ok(out);
+  assert.equal(out.disputed_span, undefined);
+});
+
+test("disputed_span empty string is treated as absent", () => {
+  const out = parseCriticJson(
+    '{"verdict":"fail","severity":3,"concerns":["x"],"disputed_span":""}'
+  );
+  assert.ok(out);
+  assert.equal(out.disputed_span, undefined);
+});
+
+test("disputed_span whitespace-only is treated as absent", () => {
+  const out = parseCriticJson(
+    '{"verdict":"fail","severity":3,"concerns":["x"],"disputed_span":"   \\n  "}'
+  );
+  assert.ok(out);
+  assert.equal(out.disputed_span, undefined);
+});
+
+test("non-string disputed_span does not crash and is dropped", () => {
+  const out = parseCriticJson(
+    '{"verdict":"fail","severity":3,"concerns":["x"],"disputed_span":42}'
+  );
+  assert.ok(out);
+  assert.equal(out.disputed_span, undefined);
+});
+
+test("oversize disputed_span is truncated with ellipsis", () => {
+  const huge = "z".repeat(5_000);
+  const raw = JSON.stringify({
+    verdict: "fail",
+    severity: 4,
+    concerns: ["bad"],
+    disputed_span: huge,
+  });
+  const out = parseCriticJson(raw);
+  assert.ok(out);
+  assert.ok(out.disputed_span);
+  assert.ok(out.disputed_span.length <= 2_001);
+  assert.ok(out.disputed_span.endsWith("…"));
+});

@@ -170,6 +170,17 @@ const TOOL_LISTING = {
               "the user's question is the first message in the session) — " +
               "do NOT pass empty string, 'none', 'n/a', or a placeholder.",
           },
+          task_type: {
+            type: "string",
+            enum: ["auto", "code", "prose", "reasoning", "research"],
+            default: "auto",
+            description:
+              "Optional. The kind of answer, which picks the critic lens. " +
+              "Leave unset (auto) and the server detects it from the answer " +
+              "(code fences -> code; citations / years -> research, etc.). " +
+              "Set it only when the user forces a lens with 'as code', " +
+              "'as prose', 'as reasoning', or 'as research'.",
+          },
         },
         required: ["question", "answer"],
       },

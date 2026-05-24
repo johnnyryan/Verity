@@ -25,7 +25,57 @@
  *   - symbolic algebra
  */
 
+import { RECOMPUTE_INDEPENDENT } from "../config.js";
 import type { RecomputeResult, RecomputeVerification } from "../types.js";
+
+// ───────────────────────────────────────────────────────────────────────────
+// CoVe-style independence scope
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Source-text scope used by the recompute detectors. Following step (3) of
+ * Chain-of-Verification (Dhuliawala et al., 2023, arXiv:2309.11495), the
+ * expression to verify is sourced WITHOUT the draft answer visible; the
+ * draft is only read for the claimed value/solution afterwards. This blocks
+ * the confirmation-bias failure mode where a verifier anchors on the
+ * draft's restated reasoning and reproduces its mistakes.
+ *
+ * Behaviour:
+ *   - independent=true, question non-empty → expressionScope = question
+ *     only, claimScope = answer.
+ *   - independent=true, question empty → expressionScope = answer (the
+ *     answer is the entire input; nothing to factor out).
+ *   - independent=false → legacy: expressionScope = question + answer.
+ *
+ * Exported for tests; the public runRecomputePass reads the flag itself.
+ */
+export interface RecomputeScope {
+  expressionScope: string;
+  claimScope: string;
+  independent: boolean;
+}
+
+export function buildRecomputeScope(
+  question: string | undefined,
+  answer: string,
+  independent: boolean
+): RecomputeScope {
+  const cleanedA = stripCodeBlocks(answer);
+  const q = (question ?? "").trim();
+  const cleanedQ = stripCodeBlocks(q);
+  if (independent) {
+    return {
+      expressionScope: cleanedQ.length > 0 ? cleanedQ : cleanedA,
+      claimScope: cleanedA,
+      independent: true,
+    };
+  }
+  return {
+    expressionScope: cleanedQ + "\n" + cleanedA,
+    claimScope: cleanedA,
+    independent: false,
+  };
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tokeniser + parser for arithmetic expressions (safe — no eval)
@@ -387,15 +437,30 @@ function parseClaimedList(items: string): number[] | null {
   return nums;
 }
 
-function detectEnumeration(answer: string): EnumerationMatch[] {
-  const cleaned = stripCodeBlocks(answer);
+/**
+ * Detect range / list-comprehension claims.
+ *
+ * Two scopes, mirroring CoVe step (3): expressions are sourced from
+ * `expressionScope` (the question when running independent; the
+ * combined question+answer under legacy A/B), claimed lists are
+ * read from `claimScope` (always the answer). When both scopes are
+ * the same string, behaviour is identical to the pre-2026-05-23
+ * single-source pass.
+ */
+function detectEnumeration(
+  expressionScope: string,
+  claimScope: string
+): EnumerationMatch[] {
   const out: EnumerationMatch[] = [];
+  const sameScope = expressionScope === claimScope;
 
   // Pattern A: [x*x for x in range(5)] = [0, 1, 4, 9, 16]
   // 2026-05-12: removed the COMP_RE.lastIndex = 0 line; matchAll on a
   // freshly-constructed regex doesn't read or mutate the original's
   // lastIndex, so the reset was dead code.
-  const compMatches = Array.from(cleaned.matchAll(new RegExp(COMP_RE.source, "gi")));
+  const compMatches = Array.from(
+    expressionScope.matchAll(new RegExp(COMP_RE.source, "gi"))
+  );
   for (const m of compMatches) {
     const a = Number(m.groups!.a);
     const b = m.groups!.b !== undefined ? Number(m.groups!.b) : null;
@@ -403,9 +468,21 @@ function detectEnumeration(answer: string): EnumerationMatch[] {
     const baseRange = computeRange(a, b, c);
     const expected = applyListCompTransform(baseRange, m.groups!.expr!, m.groups!.var!);
     if (!expected) continue;
-    // Look for a claimed list near this match (within 120 chars after)
-    const tail = cleaned.slice(m.index! + m[0].length, m.index! + m[0].length + 200);
-    const claimMatch = ENUM_CLAIM_RE.exec(tail);
+    // Look for a claimed list near this match. When expression and claim
+    // share a scope (legacy / no-question), the proximity rule stays
+    // tight (200 chars after the comprehension). When they differ
+    // (independent + question supplied the comprehension), search the
+    // whole claim scope for the first matching list assertion.
+    let claimMatch: RegExpExecArray | null = null;
+    if (sameScope) {
+      const tail = expressionScope.slice(
+        m.index! + m[0].length,
+        m.index! + m[0].length + 200
+      );
+      claimMatch = ENUM_CLAIM_RE.exec(tail);
+    } else {
+      claimMatch = ENUM_CLAIM_RE.exec(claimScope);
+    }
     if (!claimMatch) continue;
     const claimed = parseClaimedList(claimMatch.groups!.items!);
     if (!claimed) continue;
@@ -418,12 +495,17 @@ function detectEnumeration(answer: string): EnumerationMatch[] {
 
   // Pattern B: range(N) directly asserted to equal [list]
   // Only fire if we didn't already match a comprehension overlapping this span.
+  // This pattern keeps the original single-source semantics: the asserted
+  // list must follow the range(...) literal directly. Under independent
+  // mode we therefore only fire when the question's range is followed by
+  // its assertion in the same scope; that is, no `range(N) produces [...]`
+  // bridging across the question and answer.
   const rangeOnlyRe = new RegExp(
     RANGE_RE.source + "\\s*(?:produces|returns|outputs|gives|is|=)\\s*\\[(?<items>[^\\]]*)\\]",
     "gi"
   );
   let m2: RegExpExecArray | null;
-  while ((m2 = rangeOnlyRe.exec(cleaned)) !== null) {
+  while ((m2 = rangeOnlyRe.exec(claimScope)) !== null) {
     const a = Number(m2.groups!.a);
     const b = m2.groups!.b !== undefined ? Number(m2.groups!.b) : null;
     const c = m2.groups!.c !== undefined ? Number(m2.groups!.c) : null;
@@ -612,27 +694,31 @@ interface LinearEqSolution {
 }
 
 /**
- * Solve any linear equations in (question + answer) and emit a verification
- * for every `kx = v` claim in the answer. Captured `expr_text` is the
- * literal claim text so the aggregator's substring suppression rule can
- * match it against NLI contradiction claims like
+ * Solve any linear equations found in `expressionScope` and emit a
+ * verification for every `kx = v` claim in `claimScope`. Captured
+ * `expr_text` is the literal claim text so the aggregator's substring
+ * suppression rule can match it against NLI contradiction claims like
  * "Divide by 3: x = 5." — the direct driver of the `subtle-math` failure.
+ *
+ * Under CoVe-style independence (RECOMPUTE_INDEPENDENT=true,
+ * runRecomputePass default), `expressionScope` is the question only and
+ * `claimScope` is the answer. Under legacy behaviour, both are
+ * (question + "\n" + answer). The split prevents the equation
+ * re-stated inside the draft from re-seeding the solver and so
+ * stops the verifier from anchoring on the draft's own reasoning.
  */
 function detectLinearEquations(
-  question: string,
-  answer: string
+  expressionScope: string,
+  claimScope: string
 ): { verifications: RecomputeVerification[]; mismatches: RecomputeResult["mismatches"] } {
   const verifications: RecomputeVerification[] = [];
   const mismatches: RecomputeResult["mismatches"] = [];
-
-  const cleanedA = stripCodeBlocks(answer);
-  const source = stripCodeBlocks(question) + "\n" + cleanedA;
 
   const solvedByVar = new Map<string, LinearEqSolution>();
   // 2026-05-12: per-call regex instances for concurrency safety.
   const linRe = new RegExp(LINEAR_EQ_RE.source, LINEAR_EQ_RE.flags);
   let em: RegExpExecArray | null;
-  while ((em = linRe.exec(source)) !== null) {
+  while ((em = linRe.exec(expressionScope)) !== null) {
     const sign = em.groups?.coeffSign ?? "";
     const digits = em.groups?.coeffDigits;
     const coefficient = (sign === "-" ? -1 : 1) * (digits ? Number(digits) : 1);
@@ -653,7 +739,7 @@ function detectLinearEquations(
 
   const varRe = new RegExp(VAR_CLAIM_RE.source, VAR_CLAIM_RE.flags);
   let cm: RegExpExecArray | null;
-  while ((cm = varRe.exec(cleanedA)) !== null) {
+  while ((cm = varRe.exec(claimScope)) !== null) {
     const variable = (cm.groups?.var ?? "").toLowerCase();
     const eq = solvedByVar.get(variable);
     if (!eq) continue;
@@ -693,20 +779,27 @@ function detectLinearEquations(
 
 export async function runRecomputePass(
   answer: string,
-  question?: string
+  question?: string,
+  opts?: { independent?: boolean }
 ): Promise<RecomputeResult> {
   const t0 = Date.now();
+  const independent = opts?.independent ?? RECOMPUTE_INDEPENDENT;
 
   const verifications: RecomputeVerification[] = [];
   const mismatches: RecomputeResult["mismatches"] = [];
 
-  // For enumeration detection, concatenate question + answer: a list
-  // comprehension is often asserted by the question, then the answer
-  // claims what it "prints". See python-list-comp test case.
-  const enumerationScope =
-    question && question.trim().length > 0
-      ? question.trim() + "\n" + answer
-      : answer;
+  const scope = buildRecomputeScope(question, answer, independent);
+
+  // For enumeration detection, prefer the question as the source of the
+  // comprehension / range when running independent (CoVe step 3): the
+  // expression is sourced without the draft visible, and the claimed
+  // list is read from the answer afterwards. Under legacy A/B (the
+  // pre-2026-05-23 path), both scopes collapse to (question + answer)
+  // so the detector behaves exactly as before.
+  const enumExpressionScope = scope.expressionScope;
+  const enumClaimScope = independent
+    ? scope.claimScope
+    : scope.expressionScope; // legacy: claims read from the combined scope too
 
   // --- arithmetic
   for (const a of detectArithmetic(answer)) {
@@ -734,8 +827,8 @@ export async function runRecomputePass(
     }
   }
 
-  // --- enumeration (uses question+answer scope)
-  for (const e of detectEnumeration(enumerationScope)) {
+  // --- enumeration (expression sourced from expressionScope; claim from claimScope)
+  for (const e of detectEnumeration(enumExpressionScope, enumClaimScope)) {
     const matches = listsMatch(e.expectedList, e.claimedList);
     const v: RecomputeVerification = {
       kind: "enumeration",
@@ -804,11 +897,17 @@ export async function runRecomputePass(
     }
   }
 
-  // --- linear equations (uses question + answer scope)
+  // --- linear equations
+  //
+  // Under RECOMPUTE_INDEPENDENT (default), `expressionScope` is the
+  // question and `claimScope` is the answer: the verifier solves only
+  // equations the question supplies and reads only the answer's
+  // claimed solutions. Under the legacy A/B path, both are the
+  // combined (question + "\n" + answer) source.
   {
     const { verifications: ve, mismatches: mi } = detectLinearEquations(
-      question ?? "",
-      answer
+      scope.expressionScope,
+      scope.claimScope
     );
     verifications.push(...ve);
     mismatches.push(...mi);

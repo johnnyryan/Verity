@@ -1,12 +1,12 @@
-# Verity Design
+# Verity — Design
 
-LLMs claim untrue things with confidence. Verity is intended to catch these hallucinations. It runs locally on cheap, old hardware, and it can work with cloud AI. This document explains how it is built and why.
+LLMs claim untrue things with confidence. Verity catches them. It runs locally on cheap, old hardware. This document explains how it is built and why.
 
 The README (`project/readmev.md`) covers install and daily use. This document covers the design and the lessons that shaped it.
 
 ## Current line-up
 
-Four roles. The names below are the current pick; treat them as placeholders. The rest of this document refers to the worker, Critic A, Critic B, and the NLI check. The "worker" is your primary LLM, the AI you ask questions. 
+Four roles. The names below are the current pick; treat them as placeholders. The rest of this document refers to the worker, Critic A, Critic B, and the NLI check.
 
 | Role     | Current model                     | Where it runs              |
 |----------|-----------------------------------|----------------------------|
@@ -19,11 +19,12 @@ Four roles. The names below are the current pick; treat them as placeholders. Th
 
 ## 1. Goals
 
-1. Catch confident wrong claims from a local LLM. (Works with cloud, too)
+1. Catch confident wrong claims from a local LLM.
 2. Use cheap, old hardware. Run everything locally.
 3. Pick critics from different training families so their blind spots do not overlap.
-4. Keep all four models resident so there is no swapping during use slowing things down. 
-5. One critic timing out should not kill the verdict.
+4. Keep all four models resident. No swapping during use.
+5. Fail soft. One critic timing out should not kill the verdict.
+6. Stay simple. One JSON tool. One MCP server. One config file.
 
 ---
 
@@ -128,7 +129,7 @@ Deep mode adds 2-sample consistency and a perplexity rescore. Deeper mode raises
 
 ## 5. Context handling
 
-Three modes manage how much context is given to critics.
+The worker runs at high context. Critics do not need that much. More context adds distractors, not signal (Chen et al., 2024). Three modes manage how much goes through.
 
 - **Minimal** (default). Question and answer only. 2-8 k tokens. Best for code review, maths, and self-contained prose.
 - **With context**. Worker passes the earlier messages the answer depends on (documents, specifications, data, constraints). Aim for under 24 k tokens.
@@ -156,15 +157,27 @@ The cross-encoder cannot generate. The worst case is a wrong label, not a fabric
 
 The cheapest check, and the only one with 100% precision when it fires. A regex pulls arithmetic, range enumerations, and unit conversions out of the answer; each expression is evaluated. A mismatch is a hard fail.
 
+For linear equations and range comprehensions the verifier follows step (3) of Chain-of-Verification (Dhuliawala et al., 2023): the expression to recompute is sourced from the question, and the draft answer is read only for the claimed value or solution. With the draft visible during expression discovery the verifier risks anchoring on the draft and reproducing its mistakes, which is the load-bearing failure CoVe identified. Gated by `RECOMPUTE_INDEPENDENT` (default on); set to 0 for A/B comparison only.
+
 A bonus: when recompute confirms a numeric expression, NLI contradictions whose claim contains that expression are suppressed. This kills the "math-subtle" false positive where the LLM-based claim checker mis-flags correct arithmetic.
 
 ### Consistency (deep modes only)
 
 Re-ask the worker N times at temperature 0.7. Compare each re-sample against the original via NLI. The fraction of original claims contradicted or unsupported across re-samples is the divergence score.
 
+K defaults to 5 in deep mode and 8 in deeper mode, following the diminishing-returns curves in Wang et al. 2022 (Self-Consistency, arXiv:2203.11171) and Manakul et al. 2023 (SelfCheckGPT): most of the gain lands by K = 5, with a long tail to ~20. Override via `CONSISTENCY_K_DEEP` / `CONSISTENCY_K_DEEPER`.
+
 Published version: SelfCheckGPT (Manakul et al., 2023). Hallucinations tend to flicker across re-samples; real knowledge stays put.
 
 Catches low-confidence guessing. Does not catch consistent overconfidence.
+
+### Semantic entropy (advisory)
+
+Re-sample the worker a small number of extra times, cluster the samples by meaning (two samples share a cluster when they bidirectionally entail one another under NLI), and report the Shannon entropy of the cluster-size distribution. Low entropy means the worker converges on one meaning across re-samples; high entropy means the surface forms differed but the underlying uncertainty was high — the confabulation signature from Farquhar et al., "Detecting Hallucinations in Large Language Models Using Semantic Entropy", Nature 2024.
+
+Why a meaning-cluster entropy and not a text-edit-distance entropy: token differences flag rare wording even when the answers agree, whereas mutual entailment treats paraphrases as the same cluster. The cross-encoder Verity already loads is enough to do the clustering, so the only added cost is the extra sample batch.
+
+Advisory only. The signal is surfaced in the rendered Markdown block between consistency and perplexity; it never moves the verdict. The consistency check remains the deep-mode hallucination spine.
 
 ### Perplexity (deep modes only, advisory)
 
@@ -181,6 +194,8 @@ If neither is available, the signal is skipped with a note. The pipeline degrade
 
 ## 7. Aggregator
 
+Fixed rules. No machine learning. The aggregator is the only place verdicts are decided.
+
 ```
 recompute mismatch:                                     fail
 any critic.severity >= 3, or NLI contradicts:            fail
@@ -190,11 +205,13 @@ consistency divergence >= 0.15 (deep modes only):        warn
 otherwise:                                                pass
 ```
 
-Perplexity is deliberately absent from these rules. Since 2026-05-22 it is an advisory note only.
+Perplexity is deliberately absent from these rules. Since 2026-05-22 it is an advisory note only and never changes the verdict. Semantic entropy (2026-05-23) sits next to perplexity in the same advisory band and likewise does not move the verdict.
 
 Recompute suppression: a verified arithmetic expression cancels any NLI contradiction whose claim contains that expression.
 
 Disputes are computed after the verdict. They list concerns one critic raised but not the other, plus verdict mismatches. Disputes never alter the verdict.
+
+**Conformal thresholds (2026-05-23).** On boot the aggregator looks for `calibrated-thresholds.json` next to its own compiled module. When present, the calibrated cut-offs add a final escalation pass: a continuous nonconformity score (the sum of critic disagreements, NLI flags, and recompute mismatches) is checked against warn and fail cut-offs derived from the (1-alpha)-quantile of a held-out clean set. The escalation is additive — it can take pass to warn or fail, and warn to fail, but never the other way. When the file is absent, the v1 thresholds in `config.ts` are used and the startup log records the source. See `docs/calibration.md` for the run procedure.
 
 ---
 
@@ -213,9 +230,10 @@ Inputs:
 | `question`      | string | yes      | The user's latest question.                    |
 | `answer`        | string | yes      | The worker's composed answer (full prose).     |
 | `mode`          | string | no       | `standard` (default), `deep`, or `deeper`.     |
+| `task_type`     | string | no       | `auto` (default), `code`, `prose`, `reasoning`, `research`. Picks the critic lens; auto-detected from the answer when unset. |
 | `prior_context` | string | no       | Earlier chat content the answer depends on.    |
 
-The schema is small on purpose. Smaller models drop fields when the schema is wide.
+The schema is kept deliberately small; smaller models drop fields when it is wide. `task_type` is optional and defaults to auto-detection, so a typical call still passes only the question and answer plus `mode`.
 
 Output: a JSON blob with critic verdicts, NLI result, recompute / consistency / perplexity blocks, disputes, consensus, and a pre-rendered Markdown summary. The worker pastes the Markdown block verbatim.
 
@@ -275,7 +293,11 @@ The prompt also covers the empty case (blank system prompt). The tool descriptio
 ## 11. Deferred
 
 - **Debate rounds.** Critics see one another's verdicts and respond. Catches more, at about twice the latency.
+- **Hybrid cloud option.** A Groq, Gemini, or Claude call as an extra critic would expand family diversity without local hardware cost. Trade-off: data leaves the device.
 - **Bi-encoder NLI pre-filter.** Cheap shortlister for long answers; cross-encoder runs only on the survivors. Cuts NLI cost on long answers in half. Not yet measured.
+- **RAGTruth and LLM-AggreFact benchmark harness.** Verity has no measured detection rate. A small driver would feed each benchmark's (question, retrieved context, answer, gold label) tuples through `verify_answer` in standard, deep, and deeper modes, then compute balanced accuracy and AUROC against the labels. Output: a one-line headline number for the readme that replaces "two LLMs plus an NLI check" with a real detection rate. Reference targets: 84% balanced accuracy on RAGTruth and 76% across LLM-AggreFact, reported by HalluGuard's fine-tuned 4B SRM. **Partially landed in v0.2.0**: harness shipped, datasets downloaded, first numbers in (RAGTruth BA 0.61, HaluEval QA BA 0.74 at standard mode with per-dataset calibrated thresholds). The aspirational 84% / 76% targets remain open and depend on a richer signal stack (see also: per-task threshold files below, and deep-mode sweeps).
+- **Critic-cited disputed spans.** Critics currently return agree or disagree per claim. Asking each critic to additionally return the answer-text span that triggered the dispute would let the agree-and-disagree table point at the offending clause rather than just naming it. Near-zero added cost; tightens the table. Borrowed from the evidence-grounded justification output used in HalluGuard's SRM.
+- **Per-task calibration files (post-v0.2.0).** v0.2.0 confirmed the score distributions differ across task families (HaluEval QA `warn=7.8` vs RAGTruth `warn=11` at the same alpha=0.1). A single `calibrated-thresholds.json` is tuned to a single dominant task family. The cleanest fix is per-task-type files (`calibrated-thresholds-research.json`, `-prose.json`, `-reasoning.json`, `-code.json`) selected by the existing `task_type` parameter on `verify_answer`. The aggregator's load path picks the right file when the verdict ladder runs. Deferred until there is enough cross-task usage to justify the extra moving parts.
 
 ---
 
@@ -461,7 +483,56 @@ Fix on 2026-05-12: the rendered Markdown block now echoes the answer at the top,
 
 Append-only record of substantive changes to Verity (code, scripts, and this design doc). Most recent on top. The Implementation-Log entries above (A.1 through A.17) remain the canonical narrative for the early-development period; this section gives a dated index of what shipped, in reverse chronological order, with cross-references back to the Appendix A entries and to git when applicable.
 
-### 2026-05-22 — Logprob confidence works (responses endpoint); perplexity demoted to advisory; confidence proxy; cloud worker; docs caught up to the critic swap
+### Versioning
+
+Dated entries carry a `vX.Y.Z` marker on the headings that correspond to a tagged release, and `package.json` moves with the latest release. Semver: behavioural-default changes or new public-API surface bump the minor; bug fixes with no API change bump the patch; the major is reserved for breaking changes to the MCP tool interface. Released versions to date:
+
+- **v0.1.0** (12 May 2026) — pre-publication baseline; the tool-name rename and critic line-up at the time.
+- **v0.2.0** (22 May 2026) — first published release. Cloud worker, logprob confidence via the `/v1/responses` endpoint, perplexity demoted to advisory, confidence proxy, docs caught up to the critic swap.
+- **v0.3.0** (24 May 2026) — calibration layer starts working: HalluGuard adoptions, upgrades #2-6, benchmark harnesses + dataset downloads, bidirectional conformal calibration, score unification across the verdict gate and bench harness, first measured detection numbers against published hallucination test sets.
+
+Earlier work is recorded by date only.
+
+### 2026-05-24 — v0.3.0: the calibration layer starts working (bidirectional default + score unification + first measured numbers)
+
+Glossary for this entry, in plain language. *Balanced accuracy* is the mean of "fraction of real hallucinations Verity flagged" and "fraction of clean answers Verity passed"; 0.5 is chance, 1.0 is perfect. *False-positive rate* is the fraction of clean answers Verity wrongly flagged; lower is better. *Precision* is the fraction of Verity's flags that turned out to be real hallucinations. *AUROC* (area under the receiver-operating curve) is a number from 0 to 1 that measures how well the underlying score separates clean from hallucinated, independent of where the threshold sits; 0.5 is chance, 1.0 is perfect. *Alpha* is the conformal "target error rate" knob: lower alpha means stricter (fewer false alarms, more misses), higher alpha means looser (more catches, more false alarms). *Nonconformity score* is the single number Verity computes per answer from its critic, NLI and recompute signals; the threshold gate turns that number into pass / warn / fail. *V1 ladder* is the original heuristic threshold rules in `config.ts` that shipped before conformal calibration arrived on 2026-05-23.
+
+Three changes ship together. The first is a behavioural-default change; the second a bug fix without which the first was inert; the third the empirical work that exposed both.
+
+**Bidirectional default.** The 2026-05-23 conformal-calibration upgrade shipped in escalation-only mode: calibrated cut-offs could only push a verdict up (`pass` → `warn` → `fail`), never relax one down. A 50-row RAGTruth sweep at standard mode produced identical numbers before and after calibration was switched on: balanced accuracy 0.46, false-positive rate 1.00 (every clean answer flagged), recall 0.93, precision 0.27. The startup log confirmed the calibrated thresholds (`warn=11`, `fail=12.8`, computed from a 200-row sweep at alpha 0.1) were loaded; the verdict gate just had nothing to escalate because the v1 rules already flagged every clean row, and the escalation-only logic could not pull them back down. The fix: `aggregator.ts` now runs calibrated thresholds in **bidirectional** mode by default. The conformal score is the decision boundary in both directions: score at or above `fail_score_threshold` → fail; at or above `warn_score_threshold` → warn; below both → pass. The v1 rules still contribute their counts to the nonconformity score (they make up the score that gets compared to the threshold), but they no longer gate the verdict. Set `VERITY_CALIBRATED_THRESHOLDS_ADDITIVE_ONLY=1` to restore the legacy escalation-only behaviour, which is the right choice when the v1 rules are a deliberate safety floor and calibration is intended only to catch under-flagging. An `error` verdict (too many critics unavailable) is never overridden in either mode; it is a system-state signal, not a quality signal.
+
+**Score unification — the bug that hid the first finding.** With bidirectional turned on, a HaluEval QA 200-row sweep still produced `verdict=pass` on every row. AUROC was 0.88 in the same run, meaning the underlying score did rank hallucinated above clean correctly; but the score the aggregator computed at verdict time was always below the threshold. Root cause: two functions had drifted out of sync. The bench harness emitted one score into the calibration file (sum of: contradictions, unsupported claims, recompute mismatches, each critic's severity, each critic's concerns count, and consistency divergence × 5 — observed range roughly 0 to 15). The aggregator computed a thinner score for the verdict (sum of: count of critics that disagreed with the majority, contradictions, unsupported claims, recompute mismatches — observed range roughly 0 to 5). Calibration set thresholds in the first range; the gate decided verdicts in the second range; the two never overlapped. The fix is one source of truth: `computeNonconformityScore` in the aggregator now uses the richer formula, and `bench-common.ts` imports the aggregator's function rather than carrying its own copy. The `aggregate()` call site passes consistency through so divergence enters the score in deep modes. The one test that assumed the thinner formula was updated.
+
+**First measured numbers.** With both fixes landed, the calibration layer actually does something. Headline results from 50-row standard-mode sweeps against the real RAGTruth and HaluEval QA datasets, with each dataset's thresholds calibrated separately at alpha 0.1:
+
+| Dataset      | v1 BA | calibrated BA | v1 FPR | calibrated FPR | v1 precision | calibrated precision |
+|--------------|------:|--------------:|-------:|---------------:|-------------:|---------------------:|
+| HaluEval QA  |  0.73 |      **0.74** |   0.53 |       **0.24** |         0.65 |             **0.75** |
+| RAGTruth     |  0.46 |      **0.61** |   1.00 |       **0.28** |         0.27 |             **0.41** |
+
+On both datasets, calibrated bidirectional cuts false-positive rate by more than half and raises precision by 10-15 percentage points. Recall trades down (HaluEval 1.00 → 0.72; RAGTruth 0.93 → 0.50) as the conformal cut-off lets the hardest cases through. That is the right trade for the chat use-case: when Verity flags an answer it is now meaningfully more likely to be right than under the v1 ladder, and the false-alarm rate falls into a range that does not train the worker to ignore the signal.
+
+AUROC is a property of the underlying score and the dataset, not of the threshold choice, and so is unchanged by calibration: HaluEval QA AUROC 0.88 (the score separates clean from hallucinated well), RAGTruth AUROC 0.57 (the score barely separates — on the summarisation and data-to-text rows that make up most of RAGTruth, clean and hallucinated answers have nearly identical score distributions). RAGTruth still benefits from calibration despite the weak signal because the calibrated threshold puts the cut-off at the right place even when the distributions overlap; calibration cannot manufacture separation the signal does not produce, but it stops the over-flagging the v1 ladder produced on those distributions.
+
+Calibration is **per-task**. HaluEval-calibrated thresholds (`warn=7.8`, `fail=8.0`) and RAGTruth-calibrated thresholds (`warn=11`, `fail=12.8`) are not interchangeable. The score distributions differ across task families. A deployment that runs Verity across mixed task types should hold per-task-type threshold files or accept that one calibration is tuned to a single dominant task. Captured as deferred work in § 11.
+
+Tests: the loader skips `calibrated-thresholds.json` under `node --test` (an inherited calibration file from a developer's earlier run would otherwise silently shift verdict assertions across the suite; `NODE_TEST_CONTEXT` detection broadened from `=== "1"` to `!= undefined` since Node sets it to `"child"`). Bidirectional behaviour exercised by mutating `ACTIVE_THRESHOLDS` within a single test scope and restoring in `finally`. New tests: "low score pulls fail to pass", "high score pulls pass to fail", "error verdict never overridden", "calibrated thresholds skipped under node --test". The obsolete "calibrated escalation: cannot override fail to pass" test is replaced. 281 → 284 tests passing. `docs/calibration.md` and `project/scripts/README-bench.md` updated. Datasets downloaded under attribution-only licences (RAGTruth MIT, HaluEval MIT, ANAH Apache-2.0) into `C:/AI/verify-data/`; LLM-AggreFact (CC-BY-ND-4.0, HuggingFace contact-form gated) and FaithBench (CC-BY-NC-SA-4.0) deferred to user-side downloads. Attribution roster at `NOTICE.md`.
+
+Polish landed in the same release: a single module-level `IS_UNDER_TEST` constant replaces the two near-duplicate test-mode checks that had drifted out of sync in `aggregator.ts` (loader gated on `NODE_TEST_CONTEXT !== undefined`, startup log on `=== "1"`; Node sets the variable to `"child"`, so the loader skipped under test but the startup log still printed). The brittle `process.argv.some((a) => a.includes("--test"))` half of the test detection is removed. A duplicate JSDoc block above `computeNonconformityScore` (the obsolete pre-unification description) is deleted so IDE tooling shows the right formula. The `hallucinationScore` adapter in `project/scripts/bench-common.ts` gained a clearer doc string flagging the historical drift it exists to prevent. The Chinese-tag regex in `project/scripts/convert-anah-source.ts` is annotated with its truncate-at-first-`<` assumption (fine for the four hallucination-label values we read, but warns any future caller widening its use). Style: `if (typeof div === "number")` tightened to `if (div != null)`.
+
+### 2026-05-23 — HalluGuard review: two deferred items added
+
+Reviewed the HalluGuard framework. It bundles three separate detectors: spectral analysis of attention matrices, NTK-based risk decomposition over gradients, and a fine-tuned Qwen3-4B reasoning model with LoRA + ORPO that emits JSON verdicts with evidence-grounded justification spans. The two internal-state methods need attention matrices and gradients and so are unreachable to a tool that speaks OpenAI-compatible HTTP; logprobs remain Verity's ceiling for in-band model signal. The fine-tuned SRM does the same job as Verity's critic panel but with a trained artefact to maintain, which conflicts with the zero-maintenance goal. Two adoptable ideas captured in § 11: a RAGTruth and LLM-AggreFact benchmark harness (to replace mechanism description with a measured detection rate in the readme), and critic-cited disputed spans (borrowed from the SRM's evidence-grounded justification output). The "loud liar versus quiet failure" finding (some models' hallucinations are obvious in one signal, others need several) is consistent with the 2026-05-22 decision to keep perplexity advisory and to rely on cross-family critics rather than any single number.
+
+**Upgrade #2 — CoVe step-3 independence applied to the recompute pass.** Reread Chain-of-Verification (Dhuliawala et al., 2023, arXiv:2309.11495) and noticed Verity's deterministic recompute had the same draft-anchoring failure mode their step (3) was designed to remove: the linear-equation and enumeration detectors both took `question + "\n" + answer` as a single source string for expression discovery, so an answer that re-stated the problem incorrectly seeded the solver with the wrong equation and the verifier then "confirmed" the draft's mistake. `signals/recompute.ts` now splits the source into an `expressionScope` (the question alone, by default) and a `claimScope` (the answer); the solver only registers equations the question supplies and reads only the answer's claimed solution. New `RECOMPUTE_INDEPENDENT` flag in `config.ts` (default on) restores legacy behaviour for A/B work. Six new tests added; 270/270 pass.
+
+- **Upgrade #3: consistency K bumped to the literature sweet spot.** `CONSISTENCY_SAMPLES_DEEP` 2 → 5 and `CONSISTENCY_SAMPLES_DEEPER` 5 → 8. Both Wang et al. 2022 (Self-Consistency, arXiv:2203.11171) and Manakul et al. 2023 (SelfCheckGPT, arXiv:2303.08896) place K ≥ 5 at the diminishing-returns knee; deeper mode pushes further into the tail. New env overrides `CONSISTENCY_K_DEEP` / `CONSISTENCY_K_DEEPER`. Source comment added near the K-read site in `signals/consistency.ts`; § 6 "Consistency" prose updated to match. Test added: `consistency.test.ts` asserts the defaults and that the worker is called exactly K times.
+- **Upgrade #4 — Semantic entropy (Farquhar et al., Nature 2024).** New `project/src/signals/semantic-entropy.ts` clusters worker re-samples by bidirectional NLI entailment and reports Shannon entropy over the cluster-size distribution. High entropy means surface-different answers with the same underlying uncertainty — a better signal than token-level perplexity for confident-but-wrong cases. The pipeline draws a parallel sample batch (consistency.ts is owned by another agent and does not expose its sample stream) and attaches `semantic_entropy` and `semantic_cluster_count` to the `ConsistencyResult` post-hoc. Surfaced advisory-only in the rendered Markdown block, between consistency and perplexity; never flips the verdict. Env gate `VERITY_SEMANTIC_ENTROPY=0` to disable; `VERITY_SEMANTIC_ENTROPY_SAMPLES` to tune N (default 3).
+- **Upgrade #5 — Conformal calibration (Yadkori 2024 / Quach 2023).** New `project/scripts/calibrate-thresholds.ts` reads a calibration JSONL emitted by the bench harness (`--emit-calibration <path>`) and writes warn / fail score cut-offs at the (1-alpha)-quantile of clean-row nonconformity scores. `aggregator.ts` loads `calibrated-thresholds.json` at boot from the directory next to itself, with the path overridable via `VERITY_CALIBRATED_THRESHOLDS_PATH`. When loaded, the calibrated cut-offs can escalate `pass` → `warn` / `fail` and `warn` → `fail`, but never the other way; v1 multi-axis rules remain the floor. Missing file → silent fallback to `config.ts` defaults with a startup log noting the source. `docs/calibration.md` covers the maths, the run procedure, and how to swap thresholds. The conformal machinery lands; the measured run waits for a labelled RAGTruth / LLM-AggreFact pass — same "machinery now, measurement later" framing as the existing bench harness deferred entry.
+- **Upgrade #6 — Critic shuffle + verbosity-bias check (Zheng 2023, MT-Bench / Chatbot Arena, arXiv:2306.05685).** Critic dispatch order is now shuffled per `/verify` call via `shuffleCritics()` in `pipeline.ts`; the timeout-fallback path now indexes the shuffled list so a timed-out critic surfaces under the correct id. Gate `CRITIC_SHUFFLE=0` restores deterministic dispatch for replay. Verbosity-bias investigation: reviewed `aggregator.ts` — the verdict is rule-based over critic severity (max), NLI counts, recompute mismatches, and consistency divergence; `totalConcerns` is computed for the summary text only and never enters the verdict ladder. A critic listing 1 versus 8 concerns at the same severity therefore lands the same verdict. Length-normalisation is moot here; documented in a comment near the aggregation point rather than forcing a fake change.
+- **Benchmark datasets downloaded under attribution-only licences.** RAGTruth (MIT), HaluEval (MIT) and ANAH (Apache 2.0) cloned into `C:/AI/verify-data/`. LLM-AggreFact (CC-BY-ND-4.0, eval-permitted but gated by a HuggingFace contact form) and FaithBench (CC-BY-NC-SA-4.0, non-commercial) are user-side downloads only; the runbook documents how. Attribution roster captured in `NOTICE.md` at the repo root. ANAH's source layout is topic-grouped with Chinese-tagged annotations (`<要点>`, `<幻觉>`, etc.); new `project/scripts/convert-anah-source.ts` flattens 783 topic rows into 1,846 per-sentence rows in the shape the existing harness eats. The public ANAH slice is Chinese-only; the bilingual claim refers to the unreleased ANAH-v2 set. Real-data smoke tests against a closed-port worker confirmed all three downloaded harnesses parse the upstream format end-to-end (3 rows each, formatting + label-mapping + TSV emission all correct).
+
+### 2026-05-22 — v0.2.0: Logprob confidence works (responses endpoint); perplexity demoted to advisory; confidence proxy; cloud worker; docs caught up to the critic swap
 
 Committed as `916caed`; 238/238 tests pass.
 

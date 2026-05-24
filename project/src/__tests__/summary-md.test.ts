@@ -37,6 +37,7 @@ function critic(overrides: Partial<CriticResult> = {}): CriticResult {
     unavailable: overrides.unavailable,
     error: overrides.error,
     latency_ms: overrides.latency_ms ?? 10,
+    disputedSpan: overrides.disputedSpan,
   };
 }
 
@@ -768,6 +769,148 @@ test("pipes in concern text are escaped", () => {
   assert.ok(
     md.includes("foo \\| bar \\| baz"),
     "pipes in concern cells must be escaped"
+  );
+});
+
+// ─── Disputed span (HalluGuard-style evidence quote) ─────────────────────
+
+test("disputed span renders in the Verity testing table when present", () => {
+  const md = renderSummaryMarkdown(
+    baseOutput({
+      consensus: "fail",
+      critics: {
+        critic_a: critic({
+          id: "critic_a",
+          display_name: "IBM Granite 3.2 8B",
+          verdict: "fail",
+          severity: 4,
+          concerns: ["capital is wrong"],
+          disputedSpan: "Paris is the capital of Spain",
+        }),
+        critic_b: critic({
+          id: "critic_b",
+          display_name: "IBM Granite 3.2 2B",
+        }),
+      },
+    })
+  );
+  assert.ok(
+    md.includes("_disputed span:_"),
+    "expected '_disputed span:_' label in the Detail cell"
+  );
+  assert.ok(
+    md.includes("Paris is the capital of Spain"),
+    "expected the verbatim span text inside the table"
+  );
+});
+
+test("disputed span renders as a Findings sub-bullet when present", () => {
+  const md = renderSummaryMarkdown(
+    baseOutput({
+      consensus: "fail",
+      critics: {
+        critic_a: critic({
+          id: "critic_a",
+          display_name: "IBM Granite 3.2 8B",
+          verdict: "fail",
+          severity: 4,
+          concerns: ["capital is wrong"],
+          disputedSpan: "Paris is the capital of Spain",
+        }),
+        critic_b: critic({
+          id: "critic_b",
+          display_name: "IBM Granite 3.2 2B",
+        }),
+      },
+    })
+  );
+  // The sub-bullet appears under the critic's main Findings line.
+  assert.match(
+    md,
+    /- _disputed span:_ "Paris is the capital of Spain"/,
+    "expected an italic 'disputed span' sub-bullet in Findings"
+  );
+});
+
+test("disputed span absent: table renders the existing format", () => {
+  // No disputedSpan on either critic. The Detail cell should hold only
+  // the concern, with no _disputed span:_ row appended.
+  const md = renderSummaryMarkdown(
+    baseOutput({
+      consensus: "fail",
+      critics: {
+        critic_a: critic({
+          id: "critic_a",
+          display_name: "IBM Granite 3.2 8B",
+          verdict: "fail",
+          severity: 4,
+          concerns: ["capital is wrong"],
+        }),
+        critic_b: critic({
+          id: "critic_b",
+          display_name: "IBM Granite 3.2 2B",
+        }),
+      },
+    })
+  );
+  assert.ok(
+    !md.includes("_disputed span:_"),
+    "no '_disputed span:_' label should appear when the field is absent"
+  );
+});
+
+test("disputed span empty string behaves as absent in the renderer", () => {
+  // Defence-in-depth: even if the parser fails to drop an empty span,
+  // the renderer must not emit the row label.
+  const md = renderSummaryMarkdown(
+    baseOutput({
+      consensus: "warn",
+      critics: {
+        critic_a: critic({
+          id: "critic_a",
+          display_name: "IBM Granite 3.2 8B",
+          verdict: "warn",
+          severity: 2,
+          concerns: ["soft hedge"],
+          disputedSpan: "",
+        }),
+        critic_b: critic({
+          id: "critic_b",
+          display_name: "IBM Granite 3.2 2B",
+        }),
+      },
+    })
+  );
+  assert.ok(
+    !md.includes("_disputed span:_"),
+    "empty disputedSpan must not produce a sub-row"
+  );
+});
+
+test("disputed span escapes pipes so it does not break the table", () => {
+  const md = renderSummaryMarkdown(
+    baseOutput({
+      consensus: "fail",
+      critics: {
+        critic_a: critic({
+          id: "critic_a",
+          display_name: "IBM Granite 3.2 8B",
+          verdict: "fail",
+          severity: 4,
+          concerns: ["bad row"],
+          disputedSpan: "row a | row b | row c",
+        }),
+        critic_b: critic({
+          id: "critic_b",
+          display_name: "IBM Granite 3.2 2B",
+        }),
+      },
+    })
+  );
+  // Span text appears in the table Detail cell with escaped pipes.
+  assert.ok(
+    md.includes("row a \\| row b \\| row c"),
+    "pipes in the disputed span must be escaped inside the table"
   );
 });
 

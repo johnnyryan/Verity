@@ -16,11 +16,16 @@ import { aggregate, renderSummaryMarkdown } from "./aggregator.js";
 import {
   CONSISTENCY_SAMPLES_DEEP,
   CONSISTENCY_SAMPLES_DEEPER,
+  CONSISTENCY_TEMPERATURE,
+  CRITIC_SHUFFLE,
   PIPELINE_TIMEOUT_MS,
+  SEMANTIC_ENTROPY_ENABLED,
+  SEMANTIC_ENTROPY_SAMPLES,
   VERBOSE_LOGGING,
 } from "./config.js";
+import { sampleWorkerN } from "./critics/worker.js";
 import { callCritic } from "./critics/call-critic.js";
-import { ALL_CRITICS } from "./critics/critic-configs.js";
+import { ALL_CRITICS, type CriticConfig } from "./critics/critic-configs.js";
 import { runNliCheck } from "./nli/classifier.js";
 import { extractClaims } from "./nli/extract-claims.js";
 import { extractClaimsLLM } from "./nli/extract-claims-llm.js";
@@ -31,6 +36,8 @@ import {
 import { runConsistencyCheck } from "./signals/consistency.js";
 import { runPerplexityCheck } from "./signals/perplexity.js";
 import { runRecomputePass } from "./signals/recompute.js";
+import { computeSemanticEntropyWithDefaultNli } from "./signals/semantic-entropy.js";
+import { stripReasoningTraces } from "./sanitize.js";
 import type {
   ConsistencyResult,
   CriticResult,
@@ -99,6 +106,31 @@ function makeTimedOutCritic(
   };
 }
 
+/**
+ * Fisher-Yates in-place shuffle. Exported so tests can pin the
+ * randomisation behaviour without poking at internals via a separate
+ * module.
+ *
+ * Reference: Zheng et al., "MT-Bench / Chatbot Arena", 2023
+ * (arXiv:2306.05685) — position bias mitigation for LLM-as-judge.
+ * Verity's two critics don't see each other's verdicts so the direct
+ * position-bias surface inside a single critic call is nil; the
+ * shuffle is defensive against any downstream consumer that picks
+ * "first critic" as authoritative.
+ */
+export function shuffleCritics(
+  critics: readonly CriticConfig[]
+): CriticConfig[] {
+  const arr = critics.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i]!;
+    arr[i] = arr[j]!;
+    arr[j] = tmp;
+  }
+  return arr;
+}
+
 export async function runVerificationPipeline(
    input: VerifyInput
  ): Promise<VerifyOutput> {
@@ -157,7 +189,18 @@ export async function runVerificationPipeline(
   // grows. The cold-load conflict it was guarding against was specific
   // to JIT-loading; OLLAMA_MAX_LOADED_MODELS=2 keeps both critics warm
   // (see start-verity.ps1).
-  const criticPromises: Promise<CriticResult>[] = ALL_CRITICS.map((cfg) =>
+  //
+  // 2026-05-23: critic dispatch order is now shuffled per call (Zheng
+  // 2023 position-bias mitigation). Defensive: critics don't see each
+  // other's verdicts so the direct LLM-as-judge position bias does not
+  // apply inside one call; the shuffle guards anything downstream that
+  // treats "first critic" as authoritative (a future debate round, a
+  // log consumer that picks index 0). Disabled via CRITIC_SHUFFLE=0 for
+  // deterministic tests and replay.
+  const orderedCritics = CRITIC_SHUFFLE
+    ? shuffleCritics(ALL_CRITICS)
+    : (ALL_CRITICS as readonly CriticConfig[]).slice();
+  const criticPromises: Promise<CriticResult>[] = orderedCritics.map((cfg) =>
     callCritic(cfg, { systemPrompt, userMessage })
   );
 
@@ -269,6 +312,40 @@ export async function runVerificationPipeline(
         }))
       : Promise.resolve(undefined);
 
+  // ── Semantic entropy (Farquhar et al., Nature 2024) ────────────────────
+  //
+  // Advisory signal: draw a small batch of re-samples, cluster them by
+  // bidirectional NLI entailment, and report the Shannon entropy of the
+  // cluster distribution. The consistency check generates samples
+  // internally and doesn't expose them on its result type; rather than
+  // rewire consistency.ts (owned by another agent) we draw a parallel
+  // batch here and attach the entropy fields to the ConsistencyResult
+  // after both promises settle. Disabled via VERITY_SEMANTIC_ENTROPY=0.
+  const semanticEntropyPromise: Promise<
+    { entropy: number; clusterCount: number } | undefined
+  > = wantsDeepSignals && SEMANTIC_ENTROPY_ENABLED
+    ? (async () => {
+        try {
+          const samples = await sampleWorkerN({
+            question,
+            n: SEMANTIC_ENTROPY_SAMPLES,
+            temperature: CONSISTENCY_TEMPERATURE,
+          });
+          const texts = samples
+            .map((s) => stripReasoningTraces(s.text))
+            .filter((t) => t.trim().length > 0);
+          if (texts.length === 0) return undefined;
+          const r = await computeSemanticEntropyWithDefaultNli(texts);
+          return { entropy: r.entropy, clusterCount: r.clusterCount };
+        } catch (err) {
+          if (VERBOSE_LOGGING) {
+            console.error("[semantic-entropy] errored:", err);
+          }
+          return undefined;
+        }
+      })()
+    : Promise.resolve(undefined);
+
   // ── Wait for everything, bounded by a hard wall-clock ceiling ────────
   //
   // Each critic has its own timeout (CRITIC_TIMEOUT_MS), but the pipeline
@@ -311,49 +388,68 @@ export async function runVerificationPipeline(
     });
   }
 
-  const [criticResults, nliResult, consistencyResult, perplexityResult, recomputeResult] =
-    await Promise.all([
-      Promise.all(
-        criticPromises.map((p, i) =>
-          withTimeoutFallback<CriticResult>(p, PIPELINE_TIMEOUT_MS, () =>
-            makeTimedOutCritic(
-              ALL_CRITICS[i].id,
-              ALL_CRITICS[i].displayName,
-              ALL_CRITICS[i].family
-            )
+  const [
+    criticResults,
+    nliResult,
+    consistencyResult,
+    perplexityResult,
+    recomputeResult,
+    semanticEntropyResult,
+  ] = await Promise.all([
+    Promise.all(
+      criticPromises.map((p, i) =>
+        withTimeoutFallback<CriticResult>(p, PIPELINE_TIMEOUT_MS, () =>
+          makeTimedOutCritic(
+            orderedCritics[i]!.id,
+            orderedCritics[i]!.displayName,
+            orderedCritics[i]!.family
           )
         )
-      ),
-      withTimeoutFallback<NliResult>(nliPromise, PIPELINE_TIMEOUT_MS, () => ({
+      )
+    ),
+    withTimeoutFallback<NliResult>(nliPromise, PIPELINE_TIMEOUT_MS, () => ({
+      ran: false,
+      claims_checked: 0,
+      contradictions: [],
+      unsupported: [],
+      notes: `NLI skipped: pipeline timeout after ${PIPELINE_TIMEOUT_MS}ms.`,
+    })),
+    withTimeoutFallback<ConsistencyResult | undefined>(
+      consistencyPromise,
+      PIPELINE_TIMEOUT_MS,
+      () => undefined
+    ),
+    withTimeoutFallback<PerplexityResult | undefined>(
+      perplexityPromise,
+      PIPELINE_TIMEOUT_MS,
+      () => undefined
+    ),
+    withTimeoutFallback<RecomputeResult>(
+      recomputePromise,
+      PIPELINE_TIMEOUT_MS,
+      () => ({
         ran: false,
-        claims_checked: 0,
-        contradictions: [],
-        unsupported: [],
-        notes: `NLI skipped: pipeline timeout after ${PIPELINE_TIMEOUT_MS}ms.`,
-      })),
-      withTimeoutFallback<ConsistencyResult | undefined>(
-        consistencyPromise,
-        PIPELINE_TIMEOUT_MS,
-        () => undefined
-      ),
-      withTimeoutFallback<PerplexityResult | undefined>(
-        perplexityPromise,
-        PIPELINE_TIMEOUT_MS,
-        () => undefined
-      ),
-      withTimeoutFallback<RecomputeResult>(
-        recomputePromise,
-        PIPELINE_TIMEOUT_MS,
-        () => ({
-          ran: false,
-          expressions_found: 0,
-          verifications: [],
-          mismatches: [],
-          notes: `Recompute skipped: pipeline timeout.`,
-          latency_ms: 0,
-        })
-      ),
-    ]);
+        expressions_found: 0,
+        verifications: [],
+        mismatches: [],
+        notes: `Recompute skipped: pipeline timeout.`,
+        latency_ms: 0,
+      })
+    ),
+    withTimeoutFallback<{ entropy: number; clusterCount: number } | undefined>(
+      semanticEntropyPromise,
+      PIPELINE_TIMEOUT_MS,
+      () => undefined
+    ),
+  ]);
+
+  // Attach semantic-entropy fields to the consistency result post-hoc.
+  // Done outside consistency.ts (which we cannot edit) — the result type
+  // has optional fields for these and the renderer treats them as advisory.
+  if (consistencyResult && semanticEntropyResult) {
+    consistencyResult.semantic_entropy = semanticEntropyResult.entropy;
+    consistencyResult.semantic_cluster_count = semanticEntropyResult.clusterCount;
+  }
 
   // 2026-05-12 (E14): keyed by id, derived from ALL_CRITICS. Adding
   // or renaming a critic is now a one-file change in critic-configs.ts;
