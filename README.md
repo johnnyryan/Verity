@@ -13,6 +13,12 @@ Verity can also produce second opinions. If you have a spare old graphics card V
 [![Zed](https://img.shields.io/badge/Zed-084CCF?logo=zedindustries&logoColor=white)](https://zed.dev/docs/assistant/mcp)
 [![+ any MCP 1.0 client](https://img.shields.io/badge/%2B%20any%20MCP%201.0%20client-8b5cf6)](https://modelcontextprotocol.io)
 
+
+
+<picture>
+  <img src="docs/verity-website-flow-mostly-false.svg" alt="Verity MCP">
+</picture>
+
 ---
 
 ## Quick start for local LLM (one-click install)
