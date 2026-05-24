@@ -4,6 +4,15 @@ LLMs confidently claim things that are manifestly untrue. Enforce has developed 
 
 Verity can also produce second opinions. If you have a spare old graphics card Verity can use it to produce second opinions at the same time that your primary LLMs responds. Both answers are then considered by your primary LLM. Once adapted for your hardware, you can easily use Verity in LM Studio. We are also sharing our system prompts, which help minimise LLM mistakes even without Verity.
 
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-D97757?logo=anthropic&logoColor=white)](https://docs.claude.com/en/docs/claude-code/mcp)
+[![Claude Desktop](https://img.shields.io/badge/Claude%20Desktop-D97757?logo=anthropic&logoColor=white)](https://modelcontextprotocol.io/quickstart/user)
+[![Cursor](https://img.shields.io/badge/Cursor-000000?logo=cursor&logoColor=white)](https://docs.cursor.com/context/model-context-protocol)
+[![Windsurf](https://img.shields.io/badge/Windsurf-00B3A6?logoColor=white)](https://docs.windsurf.com/windsurf/cascade/mcp)
+[![Cline](https://img.shields.io/badge/Cline-1d4ed8?logo=visualstudiocode&logoColor=white)](https://github.com/cline/cline)
+[![Codex CLI](https://img.shields.io/badge/Codex%20CLI-10A37F?logo=openai&logoColor=white)](https://github.com/openai/codex)
+[![Zed](https://img.shields.io/badge/Zed-084CCF?logo=zedindustries&logoColor=white)](https://zed.dev/docs/assistant/mcp)
+[![+ any MCP 1.0 client](https://img.shields.io/badge/%2B%20any%20MCP%201.0%20client-8b5cf6)](https://modelcontextprotocol.io)
+
 ---
 
 ## Quick start for local LLM (one-click install)
