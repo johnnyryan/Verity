@@ -1,0 +1,318 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 640" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', system-ui, sans-serif">
+  <rect width="1400" height="640" fill="#ffffff"/>
+
+  <defs>
+    <filter id="inset-shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feFlood flood-color="rgba(0, 13, 27, 0.18)" result="color"/>
+      <feComposite in="color" in2="SourceAlpha" operator="out" result="outerColor"/>
+      <feGaussianBlur in="outerColor" stdDeviation="3" result="blurred"/>
+      <feOffset in="blurred" dx="0" dy="2" result="offsetBlurred"/>
+      <feComposite in="offsetBlurred" in2="SourceAlpha" operator="in" result="innerShadow"/>
+      <feComposite in="SourceGraphic" in2="innerShadow" operator="over"/>
+    </filter>
+
+    <filter id="card-shadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10" result="blurred"/>
+      <feOffset in="blurred" dx="0" dy="6" result="offset"/>
+      <feFlood flood-color="rgba(0, 13, 27, 0.08)" result="color"/>
+      <feComposite in="color" in2="offset" operator="in" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <clipPath id="claim1-clip">
+      <rect x="60" y="316" width="0" height="48">
+        <animate attributeName="width" dur="28s" repeatCount="indefinite"
+          keyTimes="0;0.001;0.0286;0.2321;0.25;1"
+          values="0;0;435;435;0;0"/>
+      </rect>
+    </clipPath>
+    <clipPath id="claim2-clip">
+      <rect x="60" y="316" width="0" height="48">
+        <animate attributeName="width" dur="28s" repeatCount="indefinite"
+          keyTimes="0;0.25;0.2786;0.4821;0.5;1"
+          values="0;0;412;412;0;0"/>
+      </rect>
+    </clipPath>
+    <clipPath id="claim3-clip">
+      <rect x="60" y="316" width="0" height="48">
+        <animate attributeName="width" dur="28s" repeatCount="indefinite"
+          keyTimes="0;0.5;0.5286;0.7321;0.75;1"
+          values="0;0;470;470;0;0"/>
+      </rect>
+    </clipPath>
+    <clipPath id="claim4-clip">
+      <rect x="60" y="316" width="0" height="48">
+        <animate attributeName="width" dur="28s" repeatCount="indefinite"
+          keyTimes="0;0.75;0.7786;0.9821;0.999;1"
+          values="0;0;230;230;0;0"/>
+      </rect>
+    </clipPath>
+
+    <path id="arrow1" d="M 540 344 L 580 344"/>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#0a2540"/>
+    </marker>
+  </defs>
+
+  <!-- AI hex -->
+  <g transform="translate(220, 130)">
+    <path d="M 70 0 L 130 35 L 130 105 L 70 140 L 10 105 L 10 35 Z" fill="#ffffff" stroke="#000d1b" stroke-width="2.5" filter="url(#card-shadow)"/>
+    <text x="70" y="92" text-anchor="middle" font-size="44" font-weight="700" fill="#000d1b">AI</text>
+    <path d="M 70 0 L 130 35 L 130 105 L 70 140 L 10 105 L 10 35 Z" fill="none" stroke="#ff2a13" stroke-width="2.5" opacity="0">
+      <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.02;0.04;0.06;0.08;0.10;0.12;0.14;0.16;0.18;0.20;0.22;0.232;0.25;0.27;0.29;0.31;0.33;0.35;0.37;0.39;0.41;0.43;0.45;0.47;0.482;0.5;0.75;0.77;0.79;0.81;0.83;0.85;0.87;0.89;0.91;0.93;0.95;0.97;0.982;1"
+        values="0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0"/>
+    </path>
+    <path d="M 70 0 L 130 35 L 130 105 L 70 140 L 10 105 L 10 35 Z" fill="none" stroke="#34c759" stroke-width="2.5" opacity="0">
+      <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.5;0.52;0.54;0.56;0.58;0.60;0.62;0.64;0.66;0.68;0.70;0.72;0.732;0.75;1"
+        values="0;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0.6;0;0;0"/>
+    </path>
+  </g>
+
+  <!-- Typing box -->
+  <rect x="40" y="308" width="500" height="72" rx="12" fill="#f5f5f7" stroke="#d2d2d7" stroke-width="1" filter="url(#inset-shadow)"/>
+
+  <!-- 4 claim texts -->
+  <text x="60" y="350" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" fill="#0a2540" clip-path="url(#claim1-clip)">2024 is a leap year so it has 365 days.</text>
+  <text x="60" y="350" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" fill="#0a2540" clip-path="url(#claim2-clip)">The speed of light is 299,792 km/hour.</text>
+  <text x="60" y="350" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" fill="#0a2540" clip-path="url(#claim3-clip)">Water boils at 100 degrees C at sea level.</text>
+  <text x="60" y="350" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" fill="#0a2540" clip-path="url(#claim4-clip)">3(5)+7 = 25. Correct!</text>
+
+  <!-- 3 thick strikethroughs (FALSE scenes 1, 2, 4) -->
+  <rect x="60" y="341" width="0" height="6" rx="2" fill="#ff2a13">
+    <animate attributeName="width" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.054;0.063;0.2321;0.25;1"
+      values="0;0;435;435;0;0"/>
+  </rect>
+  <rect x="60" y="341" width="0" height="6" rx="2" fill="#ff2a13">
+    <animate attributeName="width" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.304;0.313;0.4821;0.5;1"
+      values="0;0;412;412;0;0"/>
+  </rect>
+  <rect x="60" y="341" width="0" height="6" rx="2" fill="#ff2a13">
+    <animate attributeName="width" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.804;0.813;0.9821;0.999;1"
+      values="0;0;230;230;0;0"/>
+  </rect>
+
+  <!-- 3 corrected texts (POP IN) -->
+  <text x="60" y="418" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" font-weight="600" fill="#34c759" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.064;0.067;0.2321;0.25;1"
+      values="0;0;1;1;0;0"/>
+    2024 is a leap year so it has 366 days.
+  </text>
+  <text x="60" y="418" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" font-weight="600" fill="#34c759" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.314;0.317;0.4821;0.5;1"
+      values="0;0;1;1;0;0"/>
+    The speed of light is 299,792 km/s.
+  </text>
+  <text x="60" y="418" font-size="18" font-family="ui-monospace, 'SF Mono', Menlo, 'Cascadia Code', Consolas, monospace" font-weight="600" fill="#34c759" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.814;0.817;0.9821;0.999;1"
+      values="0;0;1;1;0;0"/>
+    3(5)+7 = 22. Correct!
+  </text>
+
+  <!-- 4 cursors -->
+  <rect x="60" y="334" width="2" height="20" fill="#0a2540" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.001;0.0276;0.0286;1"
+      values="0;1;1;0;0"/>
+    <animate attributeName="x" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.001;0.0286;1"
+      values="60;60;495;495"/>
+  </rect>
+  <rect x="60" y="334" width="2" height="20" fill="#0a2540" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.25;0.251;0.2776;0.2786;1"
+      values="0;0;1;1;0;0"/>
+    <animate attributeName="x" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.25;0.2786;1"
+      values="60;60;472;472"/>
+  </rect>
+  <rect x="60" y="334" width="2" height="20" fill="#0a2540" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.5;0.501;0.5276;0.5286;1"
+      values="0;0;1;1;0;0"/>
+    <animate attributeName="x" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.5;0.5286;1"
+      values="60;60;530;530"/>
+  </rect>
+  <rect x="60" y="334" width="2" height="20" fill="#0a2540" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.75;0.751;0.7776;0.7786;1"
+      values="0;0;1;1;0;0"/>
+    <animate attributeName="x" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.75;0.7786;1"
+      values="60;60;290;290"/>
+  </rect>
+
+  <!-- Arrow 1 -->
+  <use href="#arrow1" stroke="#0a2540" stroke-width="1.5" opacity="0.5" fill="none" marker-end="url(#arrowhead)"/>
+  <circle r="6" fill="#ff2a13" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.0276;0.0286;0.0365;0.0375;1"
+      values="0;0;1;1;0;0"/>
+    <animateMotion dur="28s" repeatCount="indefinite"
+      calcMode="spline"
+      keyTimes="0;0.0286;0.0375;1" keyPoints="0;0;1;1"
+      keySplines="0 0 1 1;0.6 0 1 1;0 0 1 1">
+      <mpath href="#arrow1"/>
+    </animateMotion>
+  </circle>
+  <circle r="6" fill="#ff2a13" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.2776;0.2786;0.2865;0.2875;1"
+      values="0;0;1;1;0;0"/>
+    <animateMotion dur="28s" repeatCount="indefinite"
+      calcMode="spline"
+      keyTimes="0;0.2786;0.2875;1" keyPoints="0;0;1;1"
+      keySplines="0 0 1 1;0.6 0 1 1;0 0 1 1">
+      <mpath href="#arrow1"/>
+    </animateMotion>
+  </circle>
+  <circle r="6" fill="#34c759" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.5276;0.5286;0.5365;0.5375;1"
+      values="0;0;1;1;0;0"/>
+    <animateMotion dur="28s" repeatCount="indefinite"
+      calcMode="spline"
+      keyTimes="0;0.5286;0.5375;1" keyPoints="0;0;1;1"
+      keySplines="0 0 1 1;0.6 0 1 1;0 0 1 1">
+      <mpath href="#arrow1"/>
+    </animateMotion>
+  </circle>
+  <circle r="6" fill="#ff2a13" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.7776;0.7786;0.7865;0.7875;1"
+      values="0;0;1;1;0;0"/>
+    <animateMotion dur="28s" repeatCount="indefinite"
+      calcMode="spline"
+      keyTimes="0;0.7786;0.7875;1" keyPoints="0;0;1;1"
+      keySplines="0 0 1 1;0.6 0 1 1;0 0 1 1">
+      <mpath href="#arrow1"/>
+    </animateMotion>
+  </circle>
+
+  <!-- Verity card -->
+  <rect x="580" y="105" width="420" height="489" rx="18" fill="#ffffff" stroke="#e5e5e7" stroke-width="1" filter="url(#card-shadow)"/>
+  <text x="790" y="160" text-anchor="middle" font-size="24" font-weight="700" fill="#000d1b" letter-spacing="4">VERITY</text>
+
+  <!-- Lane 1 -->
+  <g transform="translate(600, 188)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0355;0.0375;0.2321;0.25;0.2855;0.2875;0.4821;0.5;0.5355;0.5375;0.7321;0.75;0.7855;0.7875;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0355;0.0375;0.2321;0.25;0.2855;0.2875;0.4821;0.5;0.5355;0.5375;0.7321;0.75;0.7855;0.7875;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0355;0.0375;0.2321;0.25;0.2855;0.2875;0.4821;0.5;0.5355;0.5375;0.7321;0.75;0.7855;0.7875;0.9821;1"
+        values="1;1;2;2;1;1;2;2;1;1;2;2;1;1;2;2;1"/>
+    </rect>
+    <text x="22" y="35" font-size="18" font-weight="600" fill="#0a2540">LLM Critic 1</text>
+  </g>
+
+  <!-- Lane 2 -->
+  <g transform="translate(600, 254)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0369;0.0389;0.2321;0.25;0.2869;0.2889;0.4821;0.5;0.5369;0.5389;0.7321;0.75;0.7869;0.7889;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0369;0.0389;0.2321;0.25;0.2869;0.2889;0.4821;0.5;0.5369;0.5389;0.7321;0.75;0.7869;0.7889;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0369;0.0389;0.2321;0.25;0.2869;0.2889;0.4821;0.5;0.5369;0.5389;0.7321;0.75;0.7869;0.7889;0.9821;1"
+        values="1;1;2;2;1;1;2;2;1;1;2;2;1;1;2;2;1"/>
+    </rect>
+    <text x="22" y="35" font-size="18" font-weight="600" fill="#0a2540">LLM Critic 2</text>
+  </g>
+
+  <!-- Lane 3 -->
+  <g transform="translate(600, 320)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0383;0.0403;0.2321;0.25;0.2883;0.2903;0.4821;0.5;0.5383;0.5403;0.7321;0.75;0.7883;0.7903;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0383;0.0403;0.2321;0.25;0.2883;0.2903;0.4821;0.5;0.5383;0.5403;0.7321;0.75;0.7883;0.7903;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0383;0.0403;0.2321;0.25;0.2883;0.2903;0.4821;0.5;0.5383;0.5403;0.7321;0.75;0.7883;0.7903;0.9821;1"
+        values="1;1;2;2;1;1;2;2;1;1;2;2;1;1;2;2;1"/>
+    </rect>
+    <text x="22" y="35" font-size="17" font-weight="600" fill="#0a2540">NLI claim check DeBERTa-v2-large</text>
+  </g>
+
+  <!-- Lane 4 -->
+  <g transform="translate(600, 386)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0397;0.0417;0.2321;0.25;0.2897;0.2917;0.4821;0.5;0.5397;0.5417;0.7321;0.75;0.7897;0.7917;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0397;0.0417;0.2321;0.25;0.2897;0.2917;0.4821;0.5;0.5397;0.5417;0.7321;0.75;0.7897;0.7917;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0397;0.0417;0.2321;0.25;0.2897;0.2917;0.4821;0.5;0.5397;0.5417;0.7321;0.75;0.7897;0.7917;0.9821;1"
+        values="1;1;2.5;2.5;1;1;2.5;2.5;1;1;2.5;2.5;1;1;2.5;2.5;1"/>
+    </rect>
+    <text x="22" y="35" font-size="18" font-weight="600" fill="#0a2540">Deterministic arithmetic</text>
+  </g>
+
+  <!-- Lane 5 -->
+  <g transform="translate(600, 452)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0411;0.0431;0.2321;0.25;0.2911;0.2931;0.4821;0.5;0.5411;0.5431;0.7321;0.75;0.7911;0.7931;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0411;0.0431;0.2321;0.25;0.2911;0.2931;0.4821;0.5;0.5411;0.5431;0.7321;0.75;0.7911;0.7931;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0411;0.0431;0.2321;0.25;0.2911;0.2931;0.4821;0.5;0.5411;0.5431;0.7321;0.75;0.7911;0.7931;0.9821;1"
+        values="1;1;2;2;1;1;2;2;1;1;2;2;1;1;2;2;1"/>
+    </rect>
+    <text x="22" y="35" font-size="18" font-weight="600" fill="#0a2540">consistency</text>
+  </g>
+
+  <!-- Lane 6: Perplexity -->
+  <g transform="translate(600, 518)">
+    <rect width="380" height="56" rx="10" fill="#ffffff" stroke="#e5e5e7" stroke-width="1">
+      <animate attributeName="fill" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0425;0.0445;0.2321;0.25;0.2925;0.2945;0.4821;0.5;0.5425;0.5445;0.7321;0.75;0.7925;0.7945;0.9821;1"
+        values="#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff;#ffffff;#d4f4d8;#d4f4d8;#ffffff;#ffffff;#ffe5e0;#ffe5e0;#ffffff"/>
+      <animate attributeName="stroke" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0425;0.0445;0.2321;0.25;0.2925;0.2945;0.4821;0.5;0.5425;0.5445;0.7321;0.75;0.7925;0.7945;0.9821;1"
+        values="#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7;#e5e5e7;#34c759;#34c759;#e5e5e7;#e5e5e7;#ff2a13;#ff2a13;#e5e5e7"/>
+      <animate attributeName="stroke-width" dur="28s" repeatCount="indefinite"
+        keyTimes="0;0.0425;0.0445;0.2321;0.25;0.2925;0.2945;0.4821;0.5;0.5425;0.5445;0.7321;0.75;0.7925;0.7945;0.9821;1"
+        values="1;1;2;2;1;1;2;2;1;1;2;2;1;1;2;2;1"/>
+    </rect>
+    <text x="22" y="35" font-size="18" font-weight="600" fill="#0a2540">Perplexity</text>
+  </g>
+
+  <!-- Verdicts: flash instantly when lane 6 (Perplexity) fills -->
+  <!-- FALSE for scenes 1, 2, 4 -->
+  <text x="1200" y="344" text-anchor="middle" dominant-baseline="middle" font-size="84" font-weight="700" fill="#ff2a13" letter-spacing="2" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.0444;0.0445;0.2321;0.25;0.2944;0.2945;0.4821;0.5;0.7944;0.7945;0.9821;0.999;1"
+      values="0;0;1;1;0;0;1;1;0;0;1;1;0;0"/>
+    FALSE
+  </text>
+  <!-- TRUE for scene 3 -->
+  <text x="1200" y="344" text-anchor="middle" dominant-baseline="middle" font-size="84" font-weight="700" fill="#34c759" letter-spacing="2" opacity="0">
+    <animate attributeName="opacity" dur="28s" repeatCount="indefinite"
+      keyTimes="0;0.5444;0.5445;0.7321;0.75;1"
+      values="0;0;1;1;0;0"/>
+    TRUE
+  </text>
+</svg>
